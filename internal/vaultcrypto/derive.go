@@ -82,6 +82,25 @@ func DecodeMetadata(rawKey []byte, salt string, encryptionVersion int, encoded s
 	}
 }
 
+func DecodeFileBody(rawKey []byte, encryptionVersion int, body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return nil, nil
+	}
+
+	switch encryptionVersion {
+	case 0:
+		return decryptGCM(rawKey, body)
+	case 2, 3:
+		contentKey, err := hkdfBytes(rawKey, "", "ObsidianAesGcm", keySize)
+		if err != nil {
+			return nil, err
+		}
+		return decryptGCM(contentKey, body)
+	default:
+		return nil, fmt.Errorf("unsupported encryption version %d", encryptionVersion)
+	}
+}
+
 func decodeMetadataV0(rawKey []byte, encoded string) (string, error) {
 	body, err := hex.DecodeString(encoded)
 	if err != nil {
@@ -91,17 +110,7 @@ func decodeMetadataV0(rawKey []byte, encoded string) (string, error) {
 		return "", errors.New("metadata ciphertext too short")
 	}
 
-	block, err := aes.NewCipher(rawKey)
-	if err != nil {
-		return "", fmt.Errorf("create AES cipher: %w", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", fmt.Errorf("create GCM: %w", err)
-	}
-
-	plaintext, err := gcm.Open(nil, body[:12], body[12:], nil)
+	plaintext, err := decryptGCM(rawKey, body)
 	if err != nil {
 		return "", fmt.Errorf("decrypt metadata: %w", err)
 	}
@@ -262,4 +271,27 @@ func xorBlock(dst []byte, src []byte) {
 	for i := range dst {
 		dst[i] ^= src[i]
 	}
+}
+
+func decryptGCM(key []byte, body []byte) ([]byte, error) {
+	if len(body) < 12 {
+		return nil, errors.New("ciphertext too short")
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("create AES cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("create GCM: %w", err)
+	}
+
+	plaintext, err := gcm.Open(nil, body[:12], body[12:], nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt GCM payload: %w", err)
+	}
+
+	return plaintext, nil
 }

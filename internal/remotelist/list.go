@@ -54,27 +54,138 @@ type pushMessage struct {
 	Deleted bool   `json:"deleted"`
 }
 
+type pullRequest struct {
+	Op  string `json:"op"`
+	UID int64  `json:"uid"`
+}
+
+type pullResponse struct {
+	Deleted bool  `json:"deleted"`
+	Size    int64 `json:"size"`
+	Pieces  int   `json:"pieces"`
+}
+
 func Snapshot(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState) ([]Entry, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("missing auth token")
 	}
 
-	rawKey, err := vaultcrypto.DecodeKey(state.EncryptionKey)
+	rawKey, conn, err := dialAndInit(ctx, logger, token, state)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	return snapshotEntries(logger, conn, rawKey, state)
+}
+
+func ReadFile(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, targetPath string) ([]byte, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, errors.New("missing auth token")
+	}
+
+	rawKey, conn, err := dialAndInit(ctx, logger, token, state)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	entries, err := snapshotEntries(logger, conn, rawKey, state)
 	if err != nil {
 		return nil, err
 	}
 
-	wsURL, err := websocketURL(state.Host)
+	var target *Entry
+	for i := range entries {
+		if entries[i].Path == targetPath {
+			target = &entries[i]
+			break
+		}
+	}
+	if target == nil {
+		return nil, fmt.Errorf("remote file %q not found", targetPath)
+	}
+	if target.Folder {
+		return nil, fmt.Errorf("%q is a folder", targetPath)
+	}
+
+	if err := writeJSONMessage(logger, conn, pullRequest{
+		Op:  "pull",
+		UID: target.UID,
+	}); err != nil {
+		return nil, err
+	}
+
+	responseBody, err := readJSONMessage(logger, conn)
 	if err != nil {
 		return nil, err
+	}
+
+	var response pullResponse
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		return nil, fmt.Errorf("decode pull response: %w", err)
+	}
+	if response.Deleted {
+		return nil, fmt.Errorf("remote file %q was deleted", targetPath)
+	}
+
+	bufferCap := 0
+	if response.Size > 0 {
+		bufferCap = int(response.Size)
+	}
+	encrypted := make([]byte, 0, bufferCap)
+	for i := 0; i < response.Pieces; i++ {
+		messageType, chunk, err := conn.ReadMessage()
+		if err != nil {
+			return nil, fmt.Errorf("read pull chunk: %w", err)
+		}
+
+		switch messageType {
+		case websocket.BinaryMessage:
+			encrypted = append(encrypted, chunk...)
+		case websocket.TextMessage:
+			logger.Debug("websocket recv", "payload", prettyJSON(chunk))
+
+			var msg serverMessage
+			if err := json.Unmarshal(chunk, &msg); err != nil {
+				return nil, fmt.Errorf("decode unexpected text frame: %w", err)
+			}
+			if msg.Op == "pong" {
+				i--
+				continue
+			}
+			if msg.Status == "err" || msg.Res == "err" {
+				return nil, errors.New(strings.TrimSpace(msg.Msg))
+			}
+			return nil, fmt.Errorf("unexpected text frame during pull: %s", strings.TrimSpace(string(chunk)))
+		default:
+			return nil, fmt.Errorf("unexpected websocket message type %d during pull", messageType)
+		}
+	}
+
+	if response.Size > 0 && int64(len(encrypted)) != response.Size {
+		logger.Warn("pull size mismatch", "expected", response.Size, "actual", len(encrypted))
+	}
+
+	return vaultcrypto.DecodeFileBody(rawKey, state.EncryptionVersion, encrypted)
+}
+
+func dialAndInit(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState) ([]byte, *websocket.Conn, error) {
+	rawKey, err := vaultcrypto.DecodeKey(state.EncryptionKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	wsURL, err := websocketURL(state.Host)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	logger.Debug("websocket connect", "url", wsURL)
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("connect websocket: %w", err)
+		return nil, nil, fmt.Errorf("connect websocket: %w", err)
 	}
-	defer conn.Close()
 
 	req := initMessage{
 		Op:                "init",
@@ -87,13 +198,19 @@ func Snapshot(ctx context.Context, logger *slog.Logger, token string, state vaul
 		EncryptionVersion: state.EncryptionVersion,
 	}
 	if err := writeJSONMessage(logger, conn, req); err != nil {
-		return nil, err
+		conn.Close()
+		return nil, nil, err
 	}
 
 	if err := awaitInitOK(logger, conn); err != nil {
-		return nil, err
+		conn.Close()
+		return nil, nil, err
 	}
 
+	return rawKey, conn, nil
+}
+
+func snapshotEntries(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state vaultstore.VaultState) ([]Entry, error) {
 	entriesByUID := make(map[int64]Entry)
 	for {
 		payload, err := readJSONMessage(logger, conn)

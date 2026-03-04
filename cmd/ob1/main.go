@@ -60,6 +60,7 @@ func run() int {
 	}
 
 	root.AddCommand(newLoginCommand(app, &apiBase, &debug))
+	root.AddCommand(newCatCommand(app, &debug))
 	root.AddCommand(newInfoCommand(app, &apiBase, &debug))
 	root.AddCommand(newListRemoteCommand(app, &debug))
 	root.AddCommand(newLogoutCommand(app, &apiBase, &debug))
@@ -194,6 +195,46 @@ func newInfoCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
 			}
 
 			return writeJSON(os.Stdout, info.Raw)
+		},
+	}
+}
+
+func newCatCommand(app *app, debug *bool) *cobra.Command {
+	return &cobra.Command{
+		Use:   "cat <filename>",
+		Short: "Write a remote file's contents to stdout",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			app.logger = newLogger(*debug)
+
+			userState, err := app.store.Load()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("no local session found; login first")
+				}
+
+				return err
+			}
+
+			vaultState, err := vaultstore.NewInDir(".").Load()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("no local vault config found; run `ob1 vault setup <id>` first")
+				}
+
+				return err
+			}
+
+			body, err := remotelist.ReadFile(cmd.Context(), app.logger, userState.Token, vaultState, args[0])
+			if err != nil {
+				return err
+			}
+
+			if _, err := os.Stdout.Write(body); err != nil {
+				return fmt.Errorf("write file to stdout: %w", err)
+			}
+
+			return nil
 		},
 	}
 }
