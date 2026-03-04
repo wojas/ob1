@@ -2,6 +2,7 @@ package commands
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,10 @@ import (
 type Runtime struct {
 	Store     *userstore.Store
 	NewLogger func(debug bool) *slog.Logger
+}
+
+type backupSession struct {
+	root string
 }
 
 func currentAPIBase(state userstore.UserState, fallback string) string {
@@ -471,7 +476,104 @@ func maybeSaveRemoteCache(store *remotelist.CacheStore, previous *remotelist.Cac
 	return store.Save(next)
 }
 
-func deleteUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry) (int, error) {
+func newBackupSession(enabled bool) *backupSession {
+	if !enabled {
+		return nil
+	}
+
+	return &backupSession{
+		root: filepath.Join(".ob1", "backup", time.Now().UTC().Format("2006-01-02T15-04-05Z")),
+	}
+}
+
+func (b *backupSession) target(path string) string {
+	if b == nil {
+		return ""
+	}
+
+	return filepath.Join(b.root, path)
+}
+
+func (b *backupSession) move(path string) (string, error) {
+	if b == nil {
+		return "", nil
+	}
+
+	target := b.target(path)
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return "", fmt.Errorf("create backup directory for %s: %w", path, err)
+	}
+	if err := os.Rename(path, target); err != nil {
+		return "", fmt.Errorf("move %s to backup: %w", path, err)
+	}
+
+	return target, nil
+}
+
+func writePulledFile(logger *slog.Logger, path string, file remotelist.File, backup *backupSession) (localFileWriteStatus, error) {
+	dir := filepath.Dir(path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return localFileUnchanged, fmt.Errorf("create directories for %s: %w", path, err)
+		}
+	}
+
+	info, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if err := os.WriteFile(path, file.Body, 0o644); err != nil {
+			return localFileUnchanged, fmt.Errorf("write %s: %w", path, err)
+		}
+		if _, err := updateLocalFileTimes(path, file.Entry.MTime); err != nil {
+			return localFileUnchanged, err
+		}
+		return localFileContentUpdated, nil
+	case err != nil:
+		return localFileUnchanged, fmt.Errorf("lstat %s: %w", path, err)
+	}
+
+	if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		return localFileUnchanged, fmt.Errorf("%s is a directory", path)
+	}
+
+	if info.Mode()&os.ModeSymlink == 0 {
+		existingBody, err := os.ReadFile(path)
+		if err != nil {
+			return localFileUnchanged, fmt.Errorf("read %s: %w", path, err)
+		}
+		if bytes.Equal(existingBody, file.Body) {
+			updated, err := updateLocalFileTimes(path, file.Entry.MTime)
+			if err != nil {
+				return localFileUnchanged, err
+			}
+			if updated {
+				return localFileMetadataOnly, nil
+			}
+			return localFileUnchanged, nil
+		}
+	}
+
+	if backup != nil {
+		backupPath, err := backup.move(path)
+		if err != nil {
+			return localFileUnchanged, err
+		}
+		logger.Warn("overwriting local file", "path", path, "backup", backupPath)
+	} else {
+		logger.Warn("overwriting local file without backup", "path", path)
+	}
+
+	if err := os.WriteFile(path, file.Body, 0o644); err != nil {
+		return localFileUnchanged, fmt.Errorf("write %s: %w", path, err)
+	}
+	if _, err := updateLocalFileTimes(path, file.Entry.MTime); err != nil {
+		return localFileUnchanged, err
+	}
+
+	return localFileContentUpdated, nil
+}
+
+func deleteUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry, backup *backupSession) (int, error) {
 	remoteFiles := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		if entry.Folder {
@@ -521,12 +623,19 @@ func deleteUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry) (i
 			return err
 		}
 
-		if err := os.Remove(relPath); err != nil {
-			return fmt.Errorf("remove %s: %w", relPath, err)
+		if backup != nil {
+			backupPath, err := backup.move(relPath)
+			if err != nil {
+				return err
+			}
+			logger.Warn("deleting unknown local file", "path", relPath, "backup", backupPath)
+		} else {
+			logger.Warn("deleting unknown local file without backup", "path", relPath)
+			if err := os.Remove(relPath); err != nil {
+				return fmt.Errorf("remove %s: %w", relPath, err)
+			}
 		}
-
 		deleted++
-		logger.Info("deleted unknown local file", "path", relPath)
 
 		return nil
 	})

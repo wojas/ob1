@@ -15,12 +15,14 @@ import (
 func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 	var onlyNotes bool
 	var deleteUnknown bool
+	var noBackup bool
 
 	cmd := &cobra.Command{
 		Use:   "pull",
 		Short: "Fetch all remote files into the current directory",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			logger := rt.NewLogger(*debug)
+			backup := newBackupSession(!noBackup)
 
 			userState, err := rt.Store.Load()
 			if err != nil {
@@ -96,7 +98,7 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 
 			if len(pathsToFetch) == 0 {
 				if deleteUnknown {
-					deleted, err := deleteUnknownLocalFiles(logger, snapshot.Entries)
+					deleted, err := deleteUnknownLocalFiles(logger, snapshot.Entries, backup)
 					if err != nil {
 						return err
 					}
@@ -120,15 +122,25 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 			}
 
 			for _, file := range files {
-				if err := writeLocalFileForce(file.Entry.Path, file); err != nil {
+				status, err := writePulledFile(logger, file.Entry.Path, file, backup)
+				if err != nil {
 					return err
 				}
 
-				logger.Info("pulled file", "path", file.Entry.Path, "bytes", len(file.Body))
+				switch status {
+				case localFileUnchanged:
+					alreadyUpToDate++
+					logger.Debug("file already up to date", "path", file.Entry.Path)
+				case localFileMetadataOnly:
+					metadataUpdated++
+					logger.Debug("updated file metadata", "path", file.Entry.Path)
+				default:
+					logger.Info("pulled file", "path", file.Entry.Path, "bytes", len(file.Body))
+				}
 			}
 
 			if deleteUnknown {
-				deleted, err := deleteUnknownLocalFiles(logger, snapshot.Entries)
+				deleted, err := deleteUnknownLocalFiles(logger, snapshot.Entries, backup)
 				if err != nil {
 					return err
 				}
@@ -143,6 +155,7 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 		},
 	}
 
+	cmd.Flags().BoolVar(&noBackup, "no-backup", false, "do not back up overwritten or deleted local files during pull")
 	cmd.Flags().BoolVar(&deleteUnknown, "delete-unknown", false, "delete non-hidden local files that do not exist in the vault")
 	cmd.Flags().BoolVar(&onlyNotes, "only-notes", false, "only fetch markdown notes (*.md)")
 
