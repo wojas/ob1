@@ -285,7 +285,7 @@ func newGetCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 				return cacheErr
 			}
 
-			files, snapshot, err := remotelist.ReadFiles(cmd.Context(), app.logger, userState.Token, vaultState, args, cached, !*noCache)
+			snapshot, err := remotelist.SyncEntries(cmd.Context(), app.logger, userState.Token, vaultState, cached, !*noCache)
 			if err != nil {
 				return err
 			}
@@ -294,13 +294,58 @@ func newGetCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 				return err
 			}
 
-			for _, file := range files {
-				targetPath, ok := safeLocalTarget(file.Entry.Path)
+			entriesByPath := make(map[string]remotelist.Entry, len(snapshot.Entries))
+			for _, entry := range snapshot.Entries {
+				entriesByPath[entry.Path] = entry
+			}
+
+			pathsToFetch := make([]string, 0, len(args))
+			for _, arg := range args {
+				targetPath, ok := safeLocalTarget(arg)
 				if !ok {
-					app.logger.Warn("skipping dangerous path", "path", file.Entry.Path)
+					app.logger.Warn("skipping dangerous path", "path", arg)
 					continue
 				}
 
+				entry, ok := entriesByPath[targetPath]
+				if !ok {
+					return fmt.Errorf("remote file %q not found", targetPath)
+				}
+				if entry.Folder {
+					return fmt.Errorf("%q is a folder", targetPath)
+				}
+
+				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry)
+				if err != nil {
+					return err
+				}
+				if upToDate {
+					if metadataOnly {
+						app.logger.Info("updated file metadata", "path", targetPath)
+					} else {
+						app.logger.Info("file already up to date", "path", targetPath)
+					}
+					continue
+				}
+
+				pathsToFetch = append(pathsToFetch, targetPath)
+			}
+
+			if len(pathsToFetch) == 0 {
+				return nil
+			}
+
+			files, refreshed, err := remotelist.ReadFiles(cmd.Context(), app.logger, userState.Token, vaultState, pathsToFetch, &snapshot, true)
+			if err != nil {
+				return err
+			}
+
+			if err := maybeSaveRemoteCache(cacheStore, &snapshot, refreshed, *noCache); err != nil {
+				return err
+			}
+
+			for _, file := range files {
+				targetPath := file.Entry.Path
 				status, err := writeLocalFile(targetPath, file)
 				if err != nil {
 					return err
@@ -879,6 +924,33 @@ func safeLocalTarget(remotePath string) (string, bool) {
 	return cleaned, true
 }
 
+func localFileMatchesRemote(path string, entry remotelist.Entry) (bool, bool, error) {
+	remoteHash := strings.TrimSpace(entry.Hash)
+	if remoteHash == "" {
+		return false, false, nil
+	}
+
+	body, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+	case errors.Is(err, os.ErrNotExist):
+		return false, false, nil
+	default:
+		return false, false, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	if vaultcrypto.PlaintextHash(body) != remoteHash {
+		return false, false, nil
+	}
+
+	updated, err := updateLocalFileTimes(path, entry.MTime)
+	if err != nil {
+		return false, false, err
+	}
+
+	return true, updated, nil
+}
+
 type localFileWriteStatus int
 
 const (
@@ -896,26 +968,24 @@ func writeLocalFile(path string, file remotelist.File) (localFileWriteStatus, er
 	}
 
 	remoteHash := strings.TrimSpace(file.Entry.Hash)
-	if remoteHash == "" {
-		remoteHash = vaultcrypto.PlaintextHash(file.Body)
-	}
-
-	existingBody, err := os.ReadFile(path)
-	switch {
-	case err == nil:
-		if vaultcrypto.PlaintextHash(existingBody) == remoteHash {
-			updated, err := updateLocalFileTimes(path, file.Entry.MTime)
-			if err != nil {
-				return localFileUnchanged, err
+	if remoteHash != "" {
+		existingBody, err := os.ReadFile(path)
+		switch {
+		case err == nil:
+			if vaultcrypto.PlaintextHash(existingBody) == remoteHash {
+				updated, err := updateLocalFileTimes(path, file.Entry.MTime)
+				if err != nil {
+					return localFileUnchanged, err
+				}
+				if updated {
+					return localFileMetadataOnly, nil
+				}
+				return localFileUnchanged, nil
 			}
-			if updated {
-				return localFileMetadataOnly, nil
-			}
-			return localFileUnchanged, nil
+		case errors.Is(err, os.ErrNotExist):
+		default:
+			return localFileUnchanged, fmt.Errorf("read %s: %w", path, err)
 		}
-	case errors.Is(err, os.ErrNotExist):
-	default:
-		return localFileUnchanged, fmt.Errorf("read %s: %w", path, err)
 	}
 
 	if err := os.WriteFile(path, file.Body, 0o644); err != nil {
