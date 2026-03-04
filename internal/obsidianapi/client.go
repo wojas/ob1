@@ -17,6 +17,8 @@ import (
 
 const DefaultBaseURL = "https://api.obsidian.md"
 
+const SupportedEncryptionVersion = 3
+
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
@@ -38,6 +40,21 @@ type UserInfo struct {
 	Name  string
 	Email string
 	Raw   json.RawMessage
+}
+
+type Vault struct {
+	ID                string `json:"id"`
+	Name              string `json:"name"`
+	Region            string `json:"region"`
+	Host              string `json:"host"`
+	Salt              string `json:"salt"`
+	Password          string `json:"password"`
+	EncryptionVersion int    `json:"encryption_version"`
+}
+
+type VaultList struct {
+	Vaults []Vault
+	Shared []Vault
 }
 
 type APIError struct {
@@ -136,6 +153,28 @@ func (c *Client) UserInfo(ctx context.Context, token string) (UserInfo, error) {
 	}
 
 	return info, nil
+}
+
+func (c *Client) ListVaults(ctx context.Context, token string) (VaultList, error) {
+	if strings.TrimSpace(token) == "" {
+		return VaultList{}, errors.New("missing auth token")
+	}
+
+	body, exchange, err := c.postJSON(ctx, "/vault/list", map[string]any{
+		"token":                        token,
+		"supported_encryption_version": SupportedEncryptionVersion,
+	}, token)
+	if err != nil {
+		return VaultList{}, err
+	}
+
+	list, err := extractVaultList(body)
+	if err != nil {
+		c.logUnexpectedError("unexpected vault list response", exchange, err)
+		return VaultList{}, err
+	}
+
+	return list, nil
 }
 
 func (c *Client) options(ctx context.Context, endpoint string, headers map[string]string) ([]byte, exchangeLog, error) {
@@ -309,6 +348,21 @@ func extractUserInfo(body []byte) (UserInfo, error) {
 	}
 
 	return info, nil
+}
+
+func extractVaultList(body []byte) (VaultList, error) {
+	var response struct {
+		Vaults []Vault `json:"vaults"`
+		Shared []Vault `json:"shared"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return VaultList{}, fmt.Errorf("decode vault list response: %w", err)
+	}
+
+	return VaultList{
+		Vaults: response.Vaults,
+		Shared: response.Shared,
+	}, nil
 }
 
 func rawString(body json.RawMessage) (string, bool) {

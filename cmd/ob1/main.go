@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -56,6 +57,7 @@ func run() int {
 	root.AddCommand(newLoginCommand(app, &apiBase, &debug))
 	root.AddCommand(newInfoCommand(app, &apiBase, &debug))
 	root.AddCommand(newLogoutCommand(app, &apiBase, &debug))
+	root.AddCommand(newVaultsCommand(app, &apiBase, &debug))
 
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		app.logger.Error(err.Error())
@@ -190,6 +192,49 @@ func newInfoCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
 	}
 }
 
+func newVaultsCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "vaults",
+		Short: "Work with remote vault metadata",
+	}
+
+	cmd.AddCommand(newVaultsListCommand(app, apiBase, debug))
+
+	return cmd
+}
+
+func newVaultsListCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List remote vaults in a table",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			app.logger = newLogger(*debug)
+
+			state, err := app.store.Load()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("no local session found; login first")
+				}
+
+				return err
+			}
+
+			baseURL := strings.TrimSpace(state.APIBaseURL)
+			if baseURL == "" {
+				baseURL = *apiBase
+			}
+
+			client := obsidianapi.New(baseURL, app.logger)
+			vaults, err := client.ListVaults(cmd.Context(), state.Token)
+			if err != nil {
+				return err
+			}
+
+			return writeVaultTable(os.Stdout, vaults)
+		},
+	}
+}
+
 func newLogger(debug bool) *slog.Logger {
 	level := slog.LevelInfo
 	if debug {
@@ -272,4 +317,59 @@ func writeJSON(out *os.File, body []byte) error {
 	}
 
 	return nil
+}
+
+func writeVaultTable(out *os.File, list obsidianapi.VaultList) error {
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "TYPE\tNAME\tID\tREGION\tHOST\tENC"); err != nil {
+		return fmt.Errorf("write vault table header: %w", err)
+	}
+
+	for _, vault := range list.Vaults {
+		if err := writeVaultRow(w, "owned", vault); err != nil {
+			return err
+		}
+	}
+	for _, vault := range list.Shared {
+		if err := writeVaultRow(w, "shared", vault); err != nil {
+			return err
+		}
+	}
+
+	if len(list.Vaults) == 0 && len(list.Shared) == 0 {
+		if _, err := fmt.Fprintln(w, "(none)\t\t\t\t\t"); err != nil {
+			return fmt.Errorf("write empty vault table: %w", err)
+		}
+	}
+
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("flush vault table: %w", err)
+	}
+
+	return nil
+}
+
+func writeVaultRow(w *tabwriter.Writer, scope string, vault obsidianapi.Vault) error {
+	if _, err := fmt.Fprintf(
+		w,
+		"%s\t%s\t%s\t%s\t%s\t%d\n",
+		scope,
+		displayOrDash(vault.Name),
+		displayOrDash(vault.ID),
+		displayOrDash(vault.Region),
+		displayOrDash(vault.Host),
+		vault.EncryptionVersion,
+	); err != nil {
+		return fmt.Errorf("write vault row: %w", err)
+	}
+
+	return nil
+}
+
+func displayOrDash(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+
+	return value
 }
