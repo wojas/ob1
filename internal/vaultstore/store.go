@@ -48,6 +48,30 @@ func (s *Store) Path() string {
 	return s.path
 }
 
+func (s *Store) Load() (VaultState, error) {
+	body, err := os.ReadFile(s.path)
+	if err != nil {
+		return VaultState{}, err
+	}
+
+	var state VaultState
+	if err := json.Unmarshal(body, &state); err != nil {
+		return VaultState{}, fmt.Errorf("decode %s: %w", s.path, err)
+	}
+
+	if state.VaultID == "" {
+		return VaultState{}, errors.New("vault config does not contain a vault id")
+	}
+	if state.Host == "" {
+		return VaultState{}, errors.New("vault config does not contain a host")
+	}
+	if state.EncryptionKey == "" {
+		return VaultState{}, errors.New("vault config does not contain an encryption key")
+	}
+
+	return state, nil
+}
+
 func (s *Store) Save(state VaultState) error {
 	if state.VaultID == "" {
 		return errors.New("cannot save empty vault id")

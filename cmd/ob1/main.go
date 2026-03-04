@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/wojas/ob1/internal/logutil"
 	"github.com/wojas/ob1/internal/obsidianapi"
+	"github.com/wojas/ob1/internal/remotelist"
 	"github.com/wojas/ob1/internal/userstore"
 	"github.com/wojas/ob1/internal/vaultcrypto"
 	"github.com/wojas/ob1/internal/vaultstore"
@@ -59,6 +61,7 @@ func run() int {
 
 	root.AddCommand(newLoginCommand(app, &apiBase, &debug))
 	root.AddCommand(newInfoCommand(app, &apiBase, &debug))
+	root.AddCommand(newListRemoteCommand(app, &debug))
 	root.AddCommand(newLogoutCommand(app, &apiBase, &debug))
 	root.AddCommand(newVaultCommand(app, &apiBase, &debug))
 
@@ -191,6 +194,41 @@ func newInfoCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
 			}
 
 			return writeJSON(os.Stdout, info.Raw)
+		},
+	}
+}
+
+func newListRemoteCommand(app *app, debug *bool) *cobra.Command {
+	return &cobra.Command{
+		Use:   "list-remote",
+		Short: "List remote vault entries through the sync websocket",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			app.logger = newLogger(*debug)
+
+			userState, err := app.store.Load()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("no local session found; login first")
+				}
+
+				return err
+			}
+
+			vaultState, err := vaultstore.NewInDir(".").Load()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("no local vault config found; run `ob1 vault setup <id>` first")
+				}
+
+				return err
+			}
+
+			entries, err := remotelist.Snapshot(cmd.Context(), app.logger, userState.Token, vaultState)
+			if err != nil {
+				return err
+			}
+
+			return writeRemoteEntryTable(os.Stdout, entries)
 		},
 	}
 }
@@ -478,6 +516,55 @@ func writeVaultRow(w *tabwriter.Writer, scope string, vault obsidianapi.Vault) e
 	return nil
 }
 
+func writeRemoteEntryTable(out *os.File, entries []remotelist.Entry) error {
+	sorted := append([]remotelist.Entry(nil), entries...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Path == sorted[j].Path {
+			return sorted[i].UID < sorted[j].UID
+		}
+		return sorted[i].Path < sorted[j].Path
+	})
+
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "PATH\tTYPE\tSIZE\tUID\tMTIME\tDEVICE"); err != nil {
+		return fmt.Errorf("write remote table header: %w", err)
+	}
+
+	for _, entry := range sorted {
+		size := "-"
+		entryType := "folder"
+		if !entry.Folder {
+			entryType = "file"
+			size = fmt.Sprintf("%d", entry.Size)
+		}
+
+		if _, err := fmt.Fprintf(
+			w,
+			"%s\t%s\t%s\t%d\t%s\t%s\n",
+			displayOrDash(entry.Path),
+			entryType,
+			size,
+			entry.UID,
+			formatUnixMillis(entry.MTime),
+			displayOrDash(entry.Device),
+		); err != nil {
+			return fmt.Errorf("write remote table row: %w", err)
+		}
+	}
+
+	if len(sorted) == 0 {
+		if _, err := fmt.Fprintln(w, "(none)\t\t\t\t\t"); err != nil {
+			return fmt.Errorf("write empty remote table: %w", err)
+		}
+	}
+
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("flush remote table: %w", err)
+	}
+
+	return nil
+}
+
 func displayOrDash(value string) string {
 	if strings.TrimSpace(value) == "" {
 		return "-"
@@ -526,4 +613,12 @@ func defaultDeviceName() (string, error) {
 	}
 
 	return filepath.Base(name), nil
+}
+
+func formatUnixMillis(ms int64) string {
+	if ms <= 0 {
+		return "-"
+	}
+
+	return time.UnixMilli(ms).UTC().Format(time.RFC3339)
 }

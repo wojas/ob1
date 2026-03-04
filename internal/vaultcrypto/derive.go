@@ -1,11 +1,16 @@
 package vaultcrypto
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/scrypt"
@@ -46,4 +51,215 @@ func KeyHash(rawKey []byte, salt string, encryptionVersion int) (string, error) 
 
 func EncodeKey(rawKey []byte) string {
 	return base64.StdEncoding.EncodeToString(rawKey)
+}
+
+func DecodeKey(encoded string) ([]byte, error) {
+	trimmed := strings.TrimSpace(encoded)
+	if trimmed == "" {
+		return nil, errors.New("missing encoded vault key")
+	}
+
+	key, err := base64.StdEncoding.DecodeString(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("decode vault key: %w", err)
+	}
+
+	if len(key) != keySize {
+		return nil, fmt.Errorf("decoded vault key has length %d, want %d", len(key), keySize)
+	}
+
+	return key, nil
+}
+
+func DecodeMetadata(rawKey []byte, salt string, encryptionVersion int, encoded string) (string, error) {
+	switch encryptionVersion {
+	case 0:
+		return decodeMetadataV0(rawKey, encoded)
+	case 2, 3:
+		return decodeMetadataSIV(rawKey, salt, encoded)
+	default:
+		return "", fmt.Errorf("unsupported encryption version %d", encryptionVersion)
+	}
+}
+
+func decodeMetadataV0(rawKey []byte, encoded string) (string, error) {
+	body, err := hex.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("hex decode metadata: %w", err)
+	}
+	if len(body) < 12 {
+		return "", errors.New("metadata ciphertext too short")
+	}
+
+	block, err := aes.NewCipher(rawKey)
+	if err != nil {
+		return "", fmt.Errorf("create AES cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("create GCM: %w", err)
+	}
+
+	plaintext, err := gcm.Open(nil, body[:12], body[12:], nil)
+	if err != nil {
+		return "", fmt.Errorf("decrypt metadata: %w", err)
+	}
+
+	return string(plaintext), nil
+}
+
+func decodeMetadataSIV(rawKey []byte, salt string, encoded string) (string, error) {
+	body, err := hex.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("hex decode metadata: %w", err)
+	}
+	if len(body) < aes.BlockSize {
+		return "", errors.New("metadata ciphertext too short")
+	}
+
+	encKey, err := hkdfBytes(rawKey, norm.NFKC.String(salt), "ObsidianAesSivEnc", keySize)
+	if err != nil {
+		return "", err
+	}
+	macKey, err := hkdfBytes(rawKey, norm.NFKC.String(salt), "ObsidianAesSivMac", keySize)
+	if err != nil {
+		return "", err
+	}
+
+	tag := append([]byte(nil), body[:aes.BlockSize]...)
+	ciphertext := body[aes.BlockSize:]
+	iv := append([]byte(nil), tag...)
+	iv[len(iv)-8] &= 0x7f
+	iv[len(iv)-4] &= 0x7f
+
+	block, err := aes.NewCipher(encKey)
+	if err != nil {
+		return "", fmt.Errorf("create AES cipher: %w", err)
+	}
+
+	plaintext := make([]byte, len(ciphertext))
+	cipher.NewCTR(block, iv).XORKeyStream(plaintext, ciphertext)
+
+	expectedTag, err := s2v(macKey, plaintext)
+	if err != nil {
+		return "", err
+	}
+	if subtle.ConstantTimeCompare(tag, expectedTag) != 1 {
+		return "", errors.New("metadata authentication failed")
+	}
+
+	return string(plaintext), nil
+}
+
+func hkdfBytes(ikm []byte, salt string, info string, size int) ([]byte, error) {
+	reader := hkdf.New(sha256.New, ikm, []byte(salt), []byte(info))
+	out := make([]byte, size)
+	if _, err := io.ReadFull(reader, out); err != nil {
+		return nil, fmt.Errorf("derive %s key: %w", info, err)
+	}
+
+	return out, nil
+}
+
+func s2v(macKey []byte, plaintext []byte) ([]byte, error) {
+	d, err := aesCMAC(macKey, make([]byte, aes.BlockSize))
+	if err != nil {
+		return nil, err
+	}
+
+	var input []byte
+	if len(plaintext) >= aes.BlockSize {
+		input = append([]byte(nil), plaintext...)
+		offset := len(input) - aes.BlockSize
+		for i := 0; i < aes.BlockSize; i++ {
+			input[offset+i] ^= d[i]
+		}
+	} else {
+		input = dbl(d)
+		padded := padBlock(plaintext)
+		for i := 0; i < aes.BlockSize; i++ {
+			input[i] ^= padded[i]
+		}
+	}
+
+	return aesCMAC(macKey, input)
+}
+
+func aesCMAC(key []byte, message []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("create CMAC cipher: %w", err)
+	}
+
+	l := make([]byte, aes.BlockSize)
+	block.Encrypt(l, l)
+	k1 := dbl(l)
+	k2 := dbl(k1)
+
+	n := 1
+	if len(message) > 0 {
+		n = (len(message) + aes.BlockSize - 1) / aes.BlockSize
+	}
+
+	lastComplete := len(message) > 0 && len(message)%aes.BlockSize == 0
+	lastBlock := make([]byte, aes.BlockSize)
+	if lastComplete {
+		copy(lastBlock, message[(n-1)*aes.BlockSize:])
+		for i := 0; i < aes.BlockSize; i++ {
+			lastBlock[i] ^= k1[i]
+		}
+	} else {
+		start := 0
+		if len(message) > 0 {
+			start = (n - 1) * aes.BlockSize
+		}
+		copy(lastBlock, padBlock(message[start:]))
+		for i := 0; i < aes.BlockSize; i++ {
+			lastBlock[i] ^= k2[i]
+		}
+	}
+
+	x := make([]byte, aes.BlockSize)
+	y := make([]byte, aes.BlockSize)
+	for i := 0; i < n-1; i++ {
+		copy(y, message[i*aes.BlockSize:(i+1)*aes.BlockSize])
+		xorBlock(y, x)
+		block.Encrypt(x, y)
+	}
+
+	copy(y, lastBlock)
+	xorBlock(y, x)
+	block.Encrypt(x, y)
+
+	return append([]byte(nil), x...), nil
+}
+
+func dbl(block []byte) []byte {
+	out := make([]byte, len(block))
+	var carry byte
+	for i := len(block) - 1; i >= 0; i-- {
+		nextCarry := block[i] >> 7
+		out[i] = (block[i] << 1) | carry
+		carry = nextCarry
+	}
+	if carry != 0 {
+		out[len(out)-1] ^= 0x87
+	}
+	return out
+}
+
+func padBlock(partial []byte) []byte {
+	out := make([]byte, aes.BlockSize)
+	copy(out, partial)
+	if len(partial) < aes.BlockSize {
+		out[len(partial)] = 0x80
+	}
+	return out
+}
+
+func xorBlock(dst []byte, src []byte) {
+	for i := range dst {
+		dst[i] ^= src[i]
+	}
 }
