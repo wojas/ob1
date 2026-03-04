@@ -3,6 +3,7 @@ module github.com/wojas/ob1
 go 1.25.4
 
 require (
+	github.com/fatih/color v1.18.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/crypto v0.48.0
@@ -12,6 +13,8 @@ require (
 
 require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 )
