@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -468,4 +469,99 @@ func maybeSaveRemoteCache(store *remotelist.CacheStore, previous *remotelist.Cac
 	}
 
 	return store.Save(next)
+}
+
+func deleteUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry) (int, error) {
+	remoteFiles := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.Folder {
+			continue
+		}
+
+		targetPath, ok := safeLocalTarget(entry.Path)
+		if !ok {
+			continue
+		}
+
+		remoteFiles[targetPath] = struct{}{}
+	}
+
+	deleted := 0
+	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == "." {
+			return nil
+		}
+
+		name := d.Name()
+		if strings.HasPrefix(name, ".") {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			logger.Warn("skipping symlink during delete-unknown", "path", path)
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		relPath := filepath.Clean(path)
+		if _, ok := remoteFiles[relPath]; ok {
+			return nil
+		}
+		if err := ensureNoSymlinkAncestor(relPath); err != nil {
+			return err
+		}
+
+		if err := os.Remove(relPath); err != nil {
+			return fmt.Errorf("remove %s: %w", relPath, err)
+		}
+
+		deleted++
+		logger.Info("deleted unknown local file", "path", relPath)
+
+		return nil
+	})
+	if err != nil {
+		return deleted, fmt.Errorf("scan local files for deletion: %w", err)
+	}
+
+	return deleted, nil
+}
+
+func ensureNoSymlinkAncestor(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "." {
+		return nil
+	}
+
+	current := ""
+	for _, part := range strings.Split(dir, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		if current == "" {
+			current = part
+		} else {
+			current = filepath.Join(current, part)
+		}
+
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("lstat %s: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to delete through symlinked directory %s", current)
+		}
+	}
+
+	return nil
 }

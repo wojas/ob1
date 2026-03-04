@@ -14,6 +14,7 @@ import (
 
 func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 	var onlyNotes bool
+	var deleteUnknown bool
 
 	cmd := &cobra.Command{
 		Use:   "pull",
@@ -94,6 +95,16 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 			}
 
 			if len(pathsToFetch) == 0 {
+				if deleteUnknown {
+					deleted, err := deleteUnknownLocalFiles(logger, snapshot.Entries)
+					if err != nil {
+						return err
+					}
+					if deleted > 0 {
+						logger.Info("deleted unknown local files", "count", deleted)
+					}
+				}
+
 				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated)
 				logger.Info("no remote files to fetch")
 				return nil
@@ -116,12 +127,23 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				logger.Info("pulled file", "path", file.Entry.Path, "bytes", len(file.Body))
 			}
 
+			if deleteUnknown {
+				deleted, err := deleteUnknownLocalFiles(logger, snapshot.Entries)
+				if err != nil {
+					return err
+				}
+				if deleted > 0 {
+					logger.Info("deleted unknown local files", "count", deleted)
+				}
+			}
+
 			logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated)
 
 			return nil
 		},
 	}
 
+	cmd.Flags().BoolVar(&deleteUnknown, "delete-unknown", false, "delete non-hidden local files that do not exist in the vault")
 	cmd.Flags().BoolVar(&onlyNotes, "only-notes", false, "only fetch markdown notes (*.md)")
 
 	return cmd
