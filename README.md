@@ -81,6 +81,12 @@ All credential files are written with mode 0600.
 - **Remote deletions are not mirrored.** Files deleted on the server are not removed locally.
 - **One-way operations only.** There is no continuous sync loop -- you explicitly `pull` and `put` files.
 
+## Contributing
+
+Contributions are welcome! For bug fixes and small improvements, go ahead and open a PR. For refactoring or larger changes, please open an issue first to discuss the approach.
+
+AI-assisted contributions are welcome. If you used AI tools, please verify and test all changes yourself before submitting, and mention the models used in your PR description.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
