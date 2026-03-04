@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -18,6 +19,8 @@ import (
 	"github.com/wojas/ob1/internal/logutil"
 	"github.com/wojas/ob1/internal/obsidianapi"
 	"github.com/wojas/ob1/internal/userstore"
+	"github.com/wojas/ob1/internal/vaultcrypto"
+	"github.com/wojas/ob1/internal/vaultstore"
 )
 
 type app struct {
@@ -57,7 +60,7 @@ func run() int {
 	root.AddCommand(newLoginCommand(app, &apiBase, &debug))
 	root.AddCommand(newInfoCommand(app, &apiBase, &debug))
 	root.AddCommand(newLogoutCommand(app, &apiBase, &debug))
-	root.AddCommand(newVaultsCommand(app, &apiBase, &debug))
+	root.AddCommand(newVaultCommand(app, &apiBase, &debug))
 
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		app.logger.Error(err.Error())
@@ -192,18 +195,19 @@ func newInfoCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
 	}
 }
 
-func newVaultsCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
+func newVaultCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "vaults",
+		Use:   "vault",
 		Short: "Work with remote vault metadata",
 	}
 
-	cmd.AddCommand(newVaultsListCommand(app, apiBase, debug))
+	cmd.AddCommand(newVaultListCommand(app, apiBase, debug))
+	cmd.AddCommand(newVaultSetupCommand(app, apiBase, debug))
 
 	return cmd
 }
 
-func newVaultsListCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
+func newVaultListCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List remote vaults in a table",
@@ -233,6 +237,114 @@ func newVaultsListCommand(app *app, apiBase *string, debug *bool) *cobra.Command
 			return writeVaultTable(os.Stdout, vaults)
 		},
 	}
+}
+
+func newVaultSetupCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
+	var vaultPassword string
+	var deviceName string
+
+	cmd := &cobra.Command{
+		Use:   "setup <id>",
+		Short: "Validate a vault password and write .ob1/vault.json",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			app.logger = newLogger(*debug)
+
+			if err := ensureCurrentDirectoryEmpty(); err != nil {
+				return err
+			}
+
+			state, err := app.store.Load()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("no local session found; login first")
+				}
+
+				return err
+			}
+
+			baseURL := strings.TrimSpace(state.APIBaseURL)
+			if baseURL == "" {
+				baseURL = *apiBase
+			}
+
+			client := obsidianapi.New(baseURL, app.logger)
+			vaults, err := client.ListVaults(cmd.Context(), state.Token)
+			if err != nil {
+				return err
+			}
+
+			vault, err := findVaultByID(vaults, args[0])
+			if err != nil {
+				return err
+			}
+
+			if strings.TrimSpace(vault.Salt) == "" {
+				return errors.New("vault does not expose a salt; managed-encryption vault setup is not implemented")
+			}
+
+			vaultPassword, err = readPasswordIfEmpty("Vault password: ", vaultPassword)
+			if err != nil {
+				return err
+			}
+
+			if strings.TrimSpace(deviceName) == "" {
+				deviceName, err = defaultDeviceName()
+				if err != nil {
+					return err
+				}
+			}
+
+			rawKey, err := vaultcrypto.DeriveKey(vaultPassword, vault.Salt)
+			if err != nil {
+				return err
+			}
+
+			keyHash, err := vaultcrypto.KeyHash(rawKey, vault.Salt, vault.EncryptionVersion)
+			if err != nil {
+				return err
+			}
+
+			if err := client.AccessVault(cmd.Context(), state.Token, vault, keyHash); err != nil {
+				return err
+			}
+
+			info, err := client.UserInfo(cmd.Context(), state.Token)
+			if err != nil {
+				return err
+			}
+
+			store := vaultstore.NewInDir(".")
+			if err := store.Save(vaultstore.VaultState{
+				VaultID:           vault.ID,
+				VaultName:         vault.Name,
+				Host:              vault.Host,
+				Region:            vault.Region,
+				EncryptionVersion: vault.EncryptionVersion,
+				EncryptionKey:     vaultcrypto.EncodeKey(rawKey),
+				Salt:              vault.Salt,
+				KeyHash:           keyHash,
+				ConflictStrategy:  "manual",
+				DeviceName:        deviceName,
+				UserEmail:         info.Email,
+				SyncVersion:       0,
+				NeedsInitialSync:  true,
+				APIBaseURL:        client.BaseURL(),
+				ConfiguredAt:      time.Now().UTC(),
+			}); err != nil {
+				return err
+			}
+
+			app.logger.Info("vault configured", "path", store.Path(), "vault_id", vault.ID, "host", vault.Host)
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&vaultPassword, "vault-password", "", "Vault encryption password")
+	cmd.Flags().StringVar(&deviceName, "device-name", "", "Device name to store in the local vault config")
+
+	return cmd
 }
 
 func newLogger(debug bool) *slog.Logger {
@@ -372,4 +484,46 @@ func displayOrDash(value string) string {
 	}
 
 	return value
+}
+
+func ensureCurrentDirectoryEmpty() error {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		return fmt.Errorf("read current directory: %w", err)
+	}
+
+	if len(entries) != 0 {
+		return errors.New("current directory is not empty")
+	}
+
+	return nil
+}
+
+func findVaultByID(list obsidianapi.VaultList, id string) (obsidianapi.Vault, error) {
+	for _, vault := range list.Vaults {
+		if vault.ID == id {
+			return vault, nil
+		}
+	}
+	for _, vault := range list.Shared {
+		if vault.ID == id {
+			return vault, nil
+		}
+	}
+
+	return obsidianapi.Vault{}, fmt.Errorf("vault %q not found", id)
+}
+
+func defaultDeviceName() (string, error) {
+	name, err := os.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("resolve hostname: %w", err)
+	}
+
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("hostname is empty; pass --device-name")
+	}
+
+	return filepath.Base(name), nil
 }

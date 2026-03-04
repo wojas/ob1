@@ -177,6 +177,22 @@ func (c *Client) ListVaults(ctx context.Context, token string) (VaultList, error
 	return list, nil
 }
 
+func (c *Client) AccessVault(ctx context.Context, token string, vault Vault, keyHash string) error {
+	if strings.TrimSpace(token) == "" {
+		return errors.New("missing auth token")
+	}
+
+	_, _, err := c.postJSON(ctx, "/vault/access", map[string]any{
+		"token":              token,
+		"vault_uid":          vault.ID,
+		"keyhash":            keyHash,
+		"host":               vault.Host,
+		"encryption_version": vault.EncryptionVersion,
+	}, token)
+
+	return err
+}
+
 func (c *Client) options(ctx context.Context, endpoint string, headers map[string]string) ([]byte, exchangeLog, error) {
 	return c.doRequest(ctx, http.MethodOptions, endpoint, nil, "", headers)
 }
