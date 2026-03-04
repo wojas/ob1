@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,14 +70,6 @@ func (h *TextHandler) Handle(_ context.Context, record slog.Record) error {
 		allAttrs = append(allAttrs, attr)
 		return true
 	})
-
-	if record.PC != 0 {
-		frames := runtime.CallersFrames([]uintptr{record.PC})
-		frame, _ := frames.Next()
-		if frame.File != "" {
-			allAttrs = append(allAttrs, slog.String("source", fmt.Sprintf("%s:%d", frame.File, frame.Line)))
-		}
-	}
 
 	for _, attr := range allAttrs {
 		h.appendAttr(&inline, &blocks, nil, attr)

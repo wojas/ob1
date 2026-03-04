@@ -66,6 +66,7 @@ func run() int {
 	root.AddCommand(newGetCommand(app, &debug, &noCache))
 	root.AddCommand(newInfoCommand(app, &apiBase, &debug))
 	root.AddCommand(newListRemoteCommand(app, &debug, &noCache))
+	root.AddCommand(newPullCommand(app, &debug, &noCache))
 	root.AddCommand(newPutCommand(app, &debug, &noCache))
 	root.AddCommand(newLogoutCommand(app, &apiBase, &debug))
 	root.AddCommand(newVaultCommand(app, &apiBase, &debug))
@@ -300,6 +301,8 @@ func newGetCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 			}
 
 			pathsToFetch := make([]string, 0, len(args))
+			alreadyUpToDate := 0
+			metadataUpdated := 0
 			for _, arg := range args {
 				targetPath, ok := safeLocalTarget(arg)
 				if !ok {
@@ -321,9 +324,11 @@ func newGetCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 				}
 				if upToDate {
 					if metadataOnly {
-						app.logger.Info("updated file metadata", "path", targetPath)
+						metadataUpdated++
+						app.logger.Debug("updated file metadata", "path", targetPath)
 					} else {
-						app.logger.Info("file already up to date", "path", targetPath)
+						alreadyUpToDate++
+						app.logger.Debug("file already up to date", "path", targetPath)
 					}
 					continue
 				}
@@ -332,6 +337,7 @@ func newGetCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 			}
 
 			if len(pathsToFetch) == 0 {
+				logLocalMatchSummary(app.logger, alreadyUpToDate, metadataUpdated)
 				return nil
 			}
 
@@ -353,17 +359,136 @@ func newGetCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 
 				switch status {
 				case localFileUnchanged:
-					app.logger.Info("file already up to date", "path", targetPath)
+					alreadyUpToDate++
+					app.logger.Debug("file already up to date", "path", targetPath)
 				case localFileMetadataOnly:
-					app.logger.Info("updated file metadata", "path", targetPath)
+					metadataUpdated++
+					app.logger.Debug("updated file metadata", "path", targetPath)
 				default:
 					app.logger.Info("fetched file", "path", targetPath, "bytes", len(file.Body))
 				}
 			}
 
+			logLocalMatchSummary(app.logger, alreadyUpToDate, metadataUpdated)
+
 			return nil
 		},
 	}
+}
+
+func newPullCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
+	var onlyNotes bool
+
+	cmd := &cobra.Command{
+		Use:   "pull",
+		Short: "Fetch all remote files into the current directory",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			app.logger = newLogger(*debug)
+
+			userState, err := app.store.Load()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("no local session found; login first")
+				}
+
+				return err
+			}
+
+			vaultState, err := vaultstore.NewInDir(".").Load()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("no local vault config found; run `ob1 vault setup <id>` first")
+				}
+
+				return err
+			}
+
+			cacheStore := remotelist.NewCacheStore(".")
+			cached, cacheErr := loadRemoteCache(cacheStore, *noCache)
+			if cacheErr != nil {
+				return cacheErr
+			}
+
+			snapshot, err := remotelist.SyncEntries(cmd.Context(), app.logger, userState.Token, vaultState, cached, !*noCache)
+			if err != nil {
+				return err
+			}
+
+			if err := maybeSaveRemoteCache(cacheStore, cached, snapshot, *noCache); err != nil {
+				return err
+			}
+
+			pathsToFetch := make([]string, 0, len(snapshot.Entries))
+			alreadyUpToDate := 0
+			metadataUpdated := 0
+			for _, entry := range snapshot.Entries {
+				if entry.Folder {
+					continue
+				}
+				if onlyNotes && !strings.EqualFold(filepath.Ext(entry.Path), ".md") {
+					continue
+				}
+
+				targetPath, ok := safeLocalTarget(entry.Path)
+				if !ok {
+					app.logger.Warn("skipping dangerous path", "path", entry.Path)
+					continue
+				}
+
+				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry)
+				if err != nil {
+					return err
+				}
+				if upToDate {
+					if metadataOnly {
+						metadataUpdated++
+						app.logger.Debug("updated file metadata", "path", targetPath)
+					} else {
+						alreadyUpToDate++
+						app.logger.Debug("file already up to date", "path", targetPath)
+					}
+					continue
+				}
+
+				if err := warnIfOverwritingLocalChanges(app.logger, targetPath, entry); err != nil {
+					return err
+				}
+
+				pathsToFetch = append(pathsToFetch, targetPath)
+			}
+
+			if len(pathsToFetch) == 0 {
+				logLocalMatchSummary(app.logger, alreadyUpToDate, metadataUpdated)
+				app.logger.Info("no remote files to fetch")
+				return nil
+			}
+
+			files, refreshed, err := remotelist.ReadFiles(cmd.Context(), app.logger, userState.Token, vaultState, pathsToFetch, &snapshot, true)
+			if err != nil {
+				return err
+			}
+
+			if err := maybeSaveRemoteCache(cacheStore, &snapshot, refreshed, *noCache); err != nil {
+				return err
+			}
+
+			for _, file := range files {
+				if err := writeLocalFileForce(file.Entry.Path, file); err != nil {
+					return err
+				}
+
+				app.logger.Info("pulled file", "path", file.Entry.Path, "bytes", len(file.Body))
+			}
+
+			logLocalMatchSummary(app.logger, alreadyUpToDate, metadataUpdated)
+
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&onlyNotes, "only-notes", false, "only fetch markdown notes (*.md)")
+
+	return cmd
 }
 
 func newPutCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
@@ -997,6 +1122,57 @@ func writeLocalFile(path string, file remotelist.File) (localFileWriteStatus, er
 	}
 
 	return localFileContentUpdated, nil
+}
+
+func writeLocalFileForce(path string, file remotelist.File) error {
+	dir := filepath.Dir(path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create directories for %s: %w", path, err)
+		}
+	}
+
+	if err := os.WriteFile(path, file.Body, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+
+	if _, err := updateLocalFileTimes(path, file.Entry.MTime); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func warnIfOverwritingLocalChanges(logger *slog.Logger, path string, entry remotelist.Entry) error {
+	remoteHash := strings.TrimSpace(entry.Hash)
+	if remoteHash == "" {
+		return nil
+	}
+
+	body, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	default:
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	if vaultcrypto.PlaintextHash(body) == remoteHash {
+		return nil
+	}
+
+	logger.Warn("overwriting local changes", "path", path)
+
+	return nil
+}
+
+func logLocalMatchSummary(logger *slog.Logger, alreadyUpToDate int, metadataUpdated int) {
+	if alreadyUpToDate == 0 && metadataUpdated == 0 {
+		return
+	}
+
+	logger.Info("local file status", "already_up_to_date", alreadyUpToDate, "metadata_updated", metadataUpdated)
 }
 
 func updateLocalFileTimes(path string, mtimeMs int64) (bool, error) {
