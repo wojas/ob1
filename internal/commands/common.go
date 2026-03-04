@@ -538,7 +538,7 @@ func newBackupSession(enabled bool) *backupSession {
 	}
 
 	return &backupSession{
-		root: filepath.Join(".ob1", "backup", time.Now().UTC().Format("2006-01-02T15-04-05Z")),
+		root: filepath.Join(".ob1", "backup", time.Now().UTC().Format("2006-01-02T15-04-05.000000Z")),
 	}
 }
 
