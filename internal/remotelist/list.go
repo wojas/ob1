@@ -14,6 +14,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/wojas/ob1/internal/clientmeta"
 	"github.com/wojas/ob1/internal/vaultcrypto"
 	"github.com/wojas/ob1/internal/vaultstore"
 )
@@ -282,7 +283,10 @@ func dialAndInit(ctx context.Context, logger *slog.Logger, token string, state v
 	}
 
 	logger.Debug("websocket connect", "url", wsURL)
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	headers := map[string][]string{
+		"User-Agent": {clientmeta.UserAgent()},
+	}
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect websocket: %w", err)
 	}

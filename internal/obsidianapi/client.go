@@ -13,6 +13,8 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"github.com/wojas/ob1/internal/clientmeta"
 )
 
 const DefaultBaseURL = "https://api.obsidian.md"
@@ -225,6 +227,7 @@ func (c *Client) doRequest(ctx context.Context, method string, endpoint string, 
 	}
 
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", clientmeta.UserAgent())
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
