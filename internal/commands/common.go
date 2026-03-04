@@ -10,11 +10,13 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 
@@ -33,6 +35,12 @@ type Runtime struct {
 type backupSession struct {
 	root string
 }
+
+const (
+	baseDirName              = ".ob1/base"
+	baseDirPerm  os.FileMode = 0o700
+	baseFilePerm os.FileMode = 0o600
+)
 
 func (rt Runtime) IsDryRun() bool {
 	return rt.DryRun != nil && *rt.DryRun
@@ -358,6 +366,9 @@ const (
 	localFileUnchanged localFileWriteStatus = iota
 	localFileMetadataOnly
 	localFileContentUpdated
+	localFileKeptLocal
+	localFileMerged
+	localFileConflict
 )
 
 func writeLocalFile(path string, file remotelist.File) (localFileWriteStatus, error) {
@@ -442,6 +453,49 @@ func warnIfOverwritingLocalChanges(logger *slog.Logger, path string, entry remot
 	return nil
 }
 
+func diff3Merge(localBody []byte, baseBody []byte, remoteBody []byte) ([]byte, bool, error) {
+	if _, err := exec.LookPath("diff3"); err != nil {
+		return nil, false, errors.New("diff3 is required for --merge but was not found in PATH")
+	}
+
+	tempDir, err := os.MkdirTemp("", "ob1-diff3-*")
+	if err != nil {
+		return nil, false, fmt.Errorf("create diff3 temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	files := []struct {
+		name string
+		body []byte
+	}{
+		{name: "local", body: localBody},
+		{name: "base", body: baseBody},
+		{name: "remote", body: remoteBody},
+	}
+
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		path := filepath.Join(tempDir, file.name)
+		if err := os.WriteFile(path, file.body, 0o600); err != nil {
+			return nil, false, fmt.Errorf("write %s: %w", path, err)
+		}
+		paths = append(paths, path)
+	}
+
+	cmd := exec.Command("diff3", "-m", "-L", "local", "-L", "base", "-L", "remote", paths[0], paths[1], paths[2])
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return output, false, nil
+	}
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return output, true, nil
+	}
+
+	return nil, false, fmt.Errorf("run diff3: %w: %s", err, strings.TrimSpace(string(output)))
+}
+
 func logDryRunPullAction(logger *slog.Logger, path string, entry remotelist.Entry, backup *backupSession) error {
 	info, err := os.Lstat(path)
 	switch {
@@ -493,6 +547,88 @@ func updateLocalFileTimes(path string, mtimeMs int64) (bool, error) {
 	}
 
 	return true, nil
+}
+
+func mergeBasePath(path string) string {
+	return filepath.Join(baseDirName, path)
+}
+
+func readMergeBase(path string) ([]byte, bool, error) {
+	body, err := os.ReadFile(mergeBasePath(path))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read merge base for %s: %w", path, err)
+	}
+
+	return body, true, nil
+}
+
+func writeMergeBase(path string, body []byte) error {
+	return writeFileAtomically(mergeBasePath(path), body, baseDirPerm, baseFilePerm)
+}
+
+func ensureMergeBaseFromLocal(path string, expectedHash string) error {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s for merge base: %w", path, err)
+	}
+	if expectedHash != "" && vaultcrypto.PlaintextHash(body) != expectedHash {
+		return nil
+	}
+
+	return writeMergeBase(path, body)
+}
+
+func removeMergeBase(path string) error {
+	err := os.Remove(mergeBasePath(path))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove merge base for %s: %w", path, err)
+	}
+
+	return nil
+}
+
+func writeFileAtomically(path string, body []byte, dirPerm os.FileMode, filePerm os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
+		return fmt.Errorf("create directory for %s: %w", path, err)
+	}
+
+	tempFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp file for %s: %w", path, err)
+	}
+
+	tempPath := tempFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tempPath)
+		}
+	}()
+
+	if err := tempFile.Chmod(filePerm); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("chmod temp file for %s: %w", path, err)
+	}
+	if _, err := tempFile.Write(body); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("write temp file for %s: %w", path, err)
+	}
+	if err := tempFile.Sync(); err != nil {
+		_ = tempFile.Close()
+		return fmt.Errorf("sync temp file for %s: %w", path, err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("close temp file for %s: %w", path, err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("replace %s: %w", path, err)
+	}
+
+	cleanup = false
+	return nil
 }
 
 func loadRemoteCache(store *remotelist.CacheStore, noCache bool) (*remotelist.CacheState, error) {
@@ -548,6 +684,10 @@ func (b *backupSession) target(path string) string {
 	}
 
 	return filepath.Join(b.root, path)
+}
+
+func (b *backupSession) enabled() bool {
+	return b != nil
 }
 
 func (b *backupSession) move(path string) (string, error) {
@@ -629,6 +769,199 @@ func writePulledFile(logger *slog.Logger, path string, file remotelist.File, bac
 	return localFileContentUpdated, nil
 }
 
+func writeMergedFile(logger *slog.Logger, path string, file remotelist.File, backup *backupSession) (localFileWriteStatus, error) {
+	dir := filepath.Dir(path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return localFileUnchanged, fmt.Errorf("create directories for %s: %w", path, err)
+		}
+	}
+
+	baseBody, hasBase, err := readMergeBase(path)
+	if err != nil {
+		return localFileUnchanged, err
+	}
+
+	info, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if err := os.WriteFile(path, file.Body, 0o644); err != nil {
+			return localFileUnchanged, fmt.Errorf("write %s: %w", path, err)
+		}
+		if _, err := updateLocalFileTimes(path, file.Entry.MTime); err != nil {
+			return localFileUnchanged, err
+		}
+		if err := writeMergeBase(path, file.Body); err != nil {
+			return localFileUnchanged, err
+		}
+		return localFileContentUpdated, nil
+	case err != nil:
+		return localFileUnchanged, fmt.Errorf("lstat %s: %w", path, err)
+	}
+
+	if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		return localFileUnchanged, fmt.Errorf("%s is a directory", path)
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		if err := replaceExistingWithBackup(logger, path, file.Body, file.Entry.MTime, backup, "overwriting symlinked local path"); err != nil {
+			return localFileUnchanged, err
+		}
+		if err := writeMergeBase(path, file.Body); err != nil {
+			return localFileUnchanged, err
+		}
+		return localFileContentUpdated, nil
+	}
+
+	localBody, err := os.ReadFile(path)
+	if err != nil {
+		return localFileUnchanged, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	if bytes.Equal(localBody, file.Body) {
+		updated, err := updateLocalFileTimes(path, file.Entry.MTime)
+		if err != nil {
+			return localFileUnchanged, err
+		}
+		if err := writeMergeBase(path, file.Body); err != nil {
+			return localFileUnchanged, err
+		}
+		if updated {
+			return localFileMetadataOnly, nil
+		}
+		return localFileUnchanged, nil
+	}
+
+	if !hasBase {
+		if isTextFileForMerge(path, localBody, nil, file.Body) {
+			conflictBody := twoWayConflict(localBody, file.Body)
+			if err := replaceExistingWithBackup(logger, path, conflictBody, file.Entry.MTime, backup, "writing conflict markers without merge base"); err != nil {
+				return localFileUnchanged, err
+			}
+			if err := writeMergeBase(path, file.Body); err != nil {
+				return localFileUnchanged, err
+			}
+			return localFileConflict, nil
+		}
+
+		if err := replaceExistingWithBackup(logger, path, file.Body, file.Entry.MTime, backup, "overwriting local file without merge base"); err != nil {
+			return localFileUnchanged, err
+		}
+		if err := writeMergeBase(path, file.Body); err != nil {
+			return localFileUnchanged, err
+		}
+		return localFileContentUpdated, nil
+	}
+
+	if bytes.Equal(baseBody, file.Body) {
+		return localFileKeptLocal, nil
+	}
+
+	if bytes.Equal(baseBody, localBody) {
+		if err := replaceExistingWithBackup(logger, path, file.Body, file.Entry.MTime, backup, "overwriting local file"); err != nil {
+			return localFileUnchanged, err
+		}
+		if err := writeMergeBase(path, file.Body); err != nil {
+			return localFileUnchanged, err
+		}
+		return localFileContentUpdated, nil
+	}
+
+	if !isTextFileForMerge(path, localBody, baseBody, file.Body) {
+		if err := replaceExistingWithBackup(logger, path, file.Body, file.Entry.MTime, backup, "overwriting binary file with divergent local and remote changes"); err != nil {
+			return localFileUnchanged, err
+		}
+		if err := writeMergeBase(path, file.Body); err != nil {
+			return localFileUnchanged, err
+		}
+		return localFileContentUpdated, nil
+	}
+
+	mergedBody, conflicted, err := diff3Merge(localBody, baseBody, file.Body)
+	if err != nil {
+		return localFileUnchanged, err
+	}
+
+	if err := replaceExistingWithBackup(logger, path, mergedBody, file.Entry.MTime, backup, "writing merged file"); err != nil {
+		return localFileUnchanged, err
+	}
+	if err := writeMergeBase(path, file.Body); err != nil {
+		return localFileUnchanged, err
+	}
+
+	if conflicted {
+		return localFileConflict, nil
+	}
+
+	return localFileMerged, nil
+}
+
+func isTextFileForMerge(path string, localBody []byte, baseBody []byte, remoteBody []byte) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".csv", ".tsv",
+		".html", ".htm", ".xml", ".css", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+		".go", ".py", ".rb", ".rs", ".java", ".kt", ".swift", ".c", ".cc", ".cpp", ".cxx",
+		".h", ".hh", ".hpp", ".hxx", ".sh", ".bash", ".zsh", ".fish", ".sql", ".graphql":
+		return true
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".pdf", ".zip", ".gz", ".tgz",
+		".xz", ".bz2", ".7z", ".rar", ".mp3", ".m4a", ".wav", ".ogg", ".mp4", ".mov", ".avi",
+		".mkv", ".webm", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".sqlite", ".db", ".bin":
+		return false
+	}
+
+	for _, body := range [][]byte{localBody, baseBody, remoteBody} {
+		if len(body) == 0 {
+			continue
+		}
+		if !utf8.Valid(body) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func twoWayConflict(localBody []byte, remoteBody []byte) []byte {
+	var b bytes.Buffer
+	b.WriteString("<<<<<<< local\n")
+	b.Write(localBody)
+	if len(localBody) != 0 && localBody[len(localBody)-1] != '\n' {
+		b.WriteByte('\n')
+	}
+	b.WriteString("=======\n")
+	b.Write(remoteBody)
+	if len(remoteBody) != 0 && remoteBody[len(remoteBody)-1] != '\n' {
+		b.WriteByte('\n')
+	}
+	b.WriteString(">>>>>>> remote\n")
+
+	return b.Bytes()
+}
+
+func replaceExistingWithBackup(logger *slog.Logger, path string, body []byte, mtimeMs int64, backup *backupSession, message string) error {
+	if backup != nil {
+		backupPath, err := backup.move(path)
+		if err != nil {
+			return err
+		}
+		logger.Warn(message, "path", path, "backup", backupPath)
+	} else {
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove %s: %w", path, err)
+		}
+		logger.Warn(message+" without backup", "path", path)
+	}
+
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if _, err := updateLocalFileTimes(path, mtimeMs); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func listUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry) ([]string, error) {
 	remoteFiles := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
@@ -705,12 +1038,14 @@ func deleteUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry, ba
 				return 0, err
 			}
 			logger.Warn("deleting unknown local file", "path", path, "backup", backupPath)
-			continue
+		} else {
+			logger.Warn("deleting unknown local file without backup", "path", path)
+			if err := os.Remove(path); err != nil {
+				return 0, fmt.Errorf("remove %s: %w", path, err)
+			}
 		}
-
-		logger.Warn("deleting unknown local file without backup", "path", path)
-		if err := os.Remove(path); err != nil {
-			return 0, fmt.Errorf("remove %s: %w", path, err)
+		if err := removeMergeBase(path); err != nil {
+			return 0, err
 		}
 	}
 

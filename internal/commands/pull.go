@@ -9,10 +9,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/wojas/ob1/internal/remotelist"
+	"github.com/wojas/ob1/internal/vaultcrypto"
 	"github.com/wojas/ob1/internal/vaultstore"
 )
 
 func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
+	var merge bool
 	var onlyNotes bool
 	var deleteUnknown bool
 	var noBackup bool
@@ -79,6 +81,11 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					return err
 				}
 				if upToDate {
+					if !rt.IsDryRun() && entry.Hash != "" {
+						if err := ensureMergeBaseFromLocal(targetPath, entry.Hash); err != nil {
+							return err
+						}
+					}
 					if metadataOnly {
 						metadataUpdated++
 						if rt.IsDryRun() {
@@ -93,12 +100,25 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					continue
 				}
 
+				if merge && entry.Hash != "" {
+					baseBody, hasBase, err := readMergeBase(targetPath)
+					if err != nil {
+						return err
+					}
+					if hasBase && vaultcrypto.PlaintextHash(baseBody) == entry.Hash {
+						logger.Info("keeping local changes", "path", targetPath)
+						continue
+					}
+				}
+
 				if rt.IsDryRun() {
 					if err := logDryRunPullAction(logger, targetPath, entry, backup); err != nil {
 						return err
 					}
-				} else if err := warnIfOverwritingLocalChanges(logger, targetPath, entry, backup); err != nil {
-					return err
+				} else if !merge {
+					if err := warnIfOverwritingLocalChanges(logger, targetPath, entry, backup); err != nil {
+						return err
+					}
 				}
 
 				pathsToFetch = append(pathsToFetch, targetPath)
@@ -154,7 +174,15 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 			}
 
 			for _, file := range files {
-				status, err := writePulledFile(logger, file.Entry.Path, file, backup)
+				var status localFileWriteStatus
+				if merge {
+					status, err = writeMergedFile(logger, file.Entry.Path, file, backup)
+				} else {
+					status, err = writePulledFile(logger, file.Entry.Path, file, backup)
+					if err == nil {
+						err = writeMergeBase(file.Entry.Path, file.Body)
+					}
+				}
 				if err != nil {
 					return err
 				}
@@ -166,6 +194,12 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				case localFileMetadataOnly:
 					metadataUpdated++
 					logger.Debug("updated file metadata", "path", file.Entry.Path)
+				case localFileKeptLocal:
+					logger.Info("keeping local changes", "path", file.Entry.Path)
+				case localFileMerged:
+					logger.Info("merged file", "path", file.Entry.Path)
+				case localFileConflict:
+					logger.Warn("merged file contains conflicts", "path", file.Entry.Path)
 				default:
 					logger.Info("pulled file", "path", file.Entry.Path, "bytes", len(file.Body))
 				}
@@ -187,6 +221,7 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 		},
 	}
 
+	cmd.Flags().BoolVar(&merge, "merge", false, "three-way merge remote changes with local changes when possible")
 	cmd.Flags().BoolVar(&noBackup, "no-backup", false, "do not back up overwritten or deleted local files during pull")
 	cmd.Flags().BoolVar(&deleteUnknown, "delete-unknown", false, "delete non-hidden local files that do not exist in the vault")
 	cmd.Flags().BoolVar(&onlyNotes, "only-notes", false, "only fetch markdown notes (*.md)")

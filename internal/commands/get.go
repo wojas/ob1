@@ -8,11 +8,14 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/wojas/ob1/internal/remotelist"
+	"github.com/wojas/ob1/internal/vaultcrypto"
 	"github.com/wojas/ob1/internal/vaultstore"
 )
 
 func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
-	return &cobra.Command{
+	var merge bool
+
+	cmd := &cobra.Command{
 		Use:   "get <file1> [file2] [fileN]",
 		Short: "Fetch remote files into the current directory",
 		Args:  cobra.MinimumNArgs(1),
@@ -80,6 +83,11 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					return err
 				}
 				if upToDate {
+					if !rt.IsDryRun() && entry.Hash != "" {
+						if err := ensureMergeBaseFromLocal(targetPath, entry.Hash); err != nil {
+							return err
+						}
+					}
 					if metadataOnly {
 						metadataUpdated++
 						if rt.IsDryRun() {
@@ -92,6 +100,17 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 						logger.Debug("file already up to date", "path", targetPath)
 					}
 					continue
+				}
+
+				if merge && entry.Hash != "" {
+					baseBody, hasBase, err := readMergeBase(targetPath)
+					if err != nil {
+						return err
+					}
+					if hasBase && vaultcrypto.PlaintextHash(baseBody) == entry.Hash {
+						logger.Info("keeping local changes", "path", targetPath)
+						continue
+					}
 				}
 
 				pathsToFetch = append(pathsToFetch, targetPath)
@@ -120,7 +139,15 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 			}
 
 			for _, file := range files {
-				status, err := writeLocalFile(file.Entry.Path, file)
+				var status localFileWriteStatus
+				if merge {
+					status, err = writeMergedFile(logger, file.Entry.Path, file, nil)
+				} else {
+					status, err = writeLocalFile(file.Entry.Path, file)
+					if err == nil {
+						err = writeMergeBase(file.Entry.Path, file.Body)
+					}
+				}
 				if err != nil {
 					return err
 				}
@@ -132,6 +159,12 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				case localFileMetadataOnly:
 					metadataUpdated++
 					logger.Debug("updated file metadata", "path", file.Entry.Path)
+				case localFileKeptLocal:
+					logger.Info("keeping local changes", "path", file.Entry.Path)
+				case localFileMerged:
+					logger.Info("merged file", "path", file.Entry.Path)
+				case localFileConflict:
+					logger.Warn("merged file contains conflicts", "path", file.Entry.Path)
 				default:
 					logger.Info("fetched file", "path", file.Entry.Path, "bytes", len(file.Body))
 				}
@@ -142,4 +175,8 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&merge, "merge", false, "three-way merge remote changes with local changes when possible")
+
+	return cmd
 }
