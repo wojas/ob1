@@ -388,7 +388,7 @@ func newListRemoteCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 	var cachedOnly bool
 
 	cmd := &cobra.Command{
-		Use:   "list-remote",
+		Use:   "list",
 		Short: "List remote vault entries through the sync websocket",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app.logger = newLogger(*debug)
