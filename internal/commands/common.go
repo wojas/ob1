@@ -519,12 +519,17 @@ func logDryRunPullAction(logger *slog.Logger, path string, entry remotelist.Entr
 	return nil
 }
 
-func logLocalMatchSummary(logger *slog.Logger, alreadyUpToDate int, metadataUpdated int) {
-	if alreadyUpToDate == 0 && metadataUpdated == 0 {
+func logLocalMatchSummary(logger *slog.Logger, alreadyUpToDate int, metadataUpdated int, basesCopied int) {
+	if alreadyUpToDate == 0 && metadataUpdated == 0 && basesCopied == 0 {
 		return
 	}
 
-	logger.Info("local file status", "already_up_to_date", alreadyUpToDate, "metadata_updated", metadataUpdated)
+	logger.Info(
+		"local file status",
+		"already_up_to_date", alreadyUpToDate,
+		"metadata_updated", metadataUpdated,
+		"bases_copied", basesCopied,
+	)
 }
 
 func updateLocalFileTimes(path string, mtimeMs int64) (bool, error) {
@@ -565,17 +570,33 @@ func readMergeBase(path string) ([]byte, bool, error) {
 	return body, true, nil
 }
 
-func writeMergeBase(path string, body []byte) error {
-	return writeFileAtomically(mergeBasePath(path), body, baseDirPerm, baseFilePerm)
+func writeMergeBase(path string, body []byte) (bool, error) {
+	basePath := mergeBasePath(path)
+	existing, err := os.ReadFile(basePath)
+	switch {
+	case err == nil:
+		if bytes.Equal(existing, body) {
+			return false, nil
+		}
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return false, fmt.Errorf("read merge base for %s: %w", path, err)
+	}
+
+	if err := writeFileAtomically(basePath, body, baseDirPerm, baseFilePerm); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
-func ensureMergeBaseFromLocal(path string, expectedHash string) error {
+func ensureMergeBaseFromLocal(path string, expectedHash string) (bool, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("read %s for merge base: %w", path, err)
+		return false, fmt.Errorf("read %s for merge base: %w", path, err)
 	}
 	if expectedHash != "" && vaultcrypto.PlaintextHash(body) != expectedHash {
-		return nil
+		return false, nil
 	}
 
 	return writeMergeBase(path, body)
@@ -769,131 +790,139 @@ func writePulledFile(logger *slog.Logger, path string, file remotelist.File, bac
 	return localFileContentUpdated, nil
 }
 
-func writeMergedFile(logger *slog.Logger, path string, file remotelist.File, backup *backupSession) (localFileWriteStatus, error) {
+func writeMergedFile(logger *slog.Logger, path string, file remotelist.File, backup *backupSession) (localFileWriteStatus, bool, error) {
 	dir := filepath.Dir(path)
 	if dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return localFileUnchanged, fmt.Errorf("create directories for %s: %w", path, err)
+			return localFileUnchanged, false, fmt.Errorf("create directories for %s: %w", path, err)
 		}
 	}
 
 	baseBody, hasBase, err := readMergeBase(path)
 	if err != nil {
-		return localFileUnchanged, err
+		return localFileUnchanged, false, err
 	}
 
 	info, err := os.Lstat(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		if err := os.WriteFile(path, file.Body, 0o644); err != nil {
-			return localFileUnchanged, fmt.Errorf("write %s: %w", path, err)
+			return localFileUnchanged, false, fmt.Errorf("write %s: %w", path, err)
 		}
 		if _, err := updateLocalFileTimes(path, file.Entry.MTime); err != nil {
-			return localFileUnchanged, err
+			return localFileUnchanged, false, err
 		}
-		if err := writeMergeBase(path, file.Body); err != nil {
-			return localFileUnchanged, err
+		baseCopied, err := writeMergeBase(path, file.Body)
+		if err != nil {
+			return localFileUnchanged, false, err
 		}
-		return localFileContentUpdated, nil
+		return localFileContentUpdated, baseCopied, nil
 	case err != nil:
-		return localFileUnchanged, fmt.Errorf("lstat %s: %w", path, err)
+		return localFileUnchanged, false, fmt.Errorf("lstat %s: %w", path, err)
 	}
 
 	if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
-		return localFileUnchanged, fmt.Errorf("%s is a directory", path)
+		return localFileUnchanged, false, fmt.Errorf("%s is a directory", path)
 	}
 
 	if info.Mode()&os.ModeSymlink != 0 {
 		if err := replaceExistingWithBackup(logger, path, file.Body, file.Entry.MTime, backup, "overwriting symlinked local path"); err != nil {
-			return localFileUnchanged, err
+			return localFileUnchanged, false, err
 		}
-		if err := writeMergeBase(path, file.Body); err != nil {
-			return localFileUnchanged, err
+		baseCopied, err := writeMergeBase(path, file.Body)
+		if err != nil {
+			return localFileUnchanged, false, err
 		}
-		return localFileContentUpdated, nil
+		return localFileContentUpdated, baseCopied, nil
 	}
 
 	localBody, err := os.ReadFile(path)
 	if err != nil {
-		return localFileUnchanged, fmt.Errorf("read %s: %w", path, err)
+		return localFileUnchanged, false, fmt.Errorf("read %s: %w", path, err)
 	}
 
 	if bytes.Equal(localBody, file.Body) {
 		updated, err := updateLocalFileTimes(path, file.Entry.MTime)
 		if err != nil {
-			return localFileUnchanged, err
+			return localFileUnchanged, false, err
 		}
-		if err := writeMergeBase(path, file.Body); err != nil {
-			return localFileUnchanged, err
+		baseCopied, err := writeMergeBase(path, file.Body)
+		if err != nil {
+			return localFileUnchanged, false, err
 		}
 		if updated {
-			return localFileMetadataOnly, nil
+			return localFileMetadataOnly, baseCopied, nil
 		}
-		return localFileUnchanged, nil
+		return localFileUnchanged, baseCopied, nil
 	}
 
 	if !hasBase {
 		if isTextFileForMerge(path, localBody, nil, file.Body) {
 			conflictBody := twoWayConflict(localBody, file.Body)
 			if err := replaceExistingWithBackup(logger, path, conflictBody, file.Entry.MTime, backup, "writing conflict markers without merge base"); err != nil {
-				return localFileUnchanged, err
+				return localFileUnchanged, false, err
 			}
-			if err := writeMergeBase(path, file.Body); err != nil {
-				return localFileUnchanged, err
+			baseCopied, err := writeMergeBase(path, file.Body)
+			if err != nil {
+				return localFileUnchanged, false, err
 			}
-			return localFileConflict, nil
+			return localFileConflict, baseCopied, nil
 		}
 
 		if err := replaceExistingWithBackup(logger, path, file.Body, file.Entry.MTime, backup, "overwriting local file without merge base"); err != nil {
-			return localFileUnchanged, err
+			return localFileUnchanged, false, err
 		}
-		if err := writeMergeBase(path, file.Body); err != nil {
-			return localFileUnchanged, err
+		baseCopied, err := writeMergeBase(path, file.Body)
+		if err != nil {
+			return localFileUnchanged, false, err
 		}
-		return localFileContentUpdated, nil
+		return localFileContentUpdated, baseCopied, nil
 	}
 
 	if bytes.Equal(baseBody, file.Body) {
-		return localFileKeptLocal, nil
+		return localFileKeptLocal, false, nil
 	}
 
 	if bytes.Equal(baseBody, localBody) {
 		if err := replaceExistingWithBackup(logger, path, file.Body, file.Entry.MTime, backup, "overwriting local file"); err != nil {
-			return localFileUnchanged, err
+			return localFileUnchanged, false, err
 		}
-		if err := writeMergeBase(path, file.Body); err != nil {
-			return localFileUnchanged, err
+		baseCopied, err := writeMergeBase(path, file.Body)
+		if err != nil {
+			return localFileUnchanged, false, err
 		}
-		return localFileContentUpdated, nil
+		return localFileContentUpdated, baseCopied, nil
 	}
 
 	if !isTextFileForMerge(path, localBody, baseBody, file.Body) {
 		if err := replaceExistingWithBackup(logger, path, file.Body, file.Entry.MTime, backup, "overwriting binary file with divergent local and remote changes"); err != nil {
-			return localFileUnchanged, err
+			return localFileUnchanged, false, err
 		}
-		if err := writeMergeBase(path, file.Body); err != nil {
-			return localFileUnchanged, err
+		baseCopied, err := writeMergeBase(path, file.Body)
+		if err != nil {
+			return localFileUnchanged, false, err
 		}
-		return localFileContentUpdated, nil
+		return localFileContentUpdated, baseCopied, nil
 	}
 
 	mergedBody, conflicted, err := diff3Merge(localBody, baseBody, file.Body)
 	if err != nil {
-		return localFileUnchanged, err
+		return localFileUnchanged, false, err
 	}
 
 	if err := replaceExistingWithBackup(logger, path, mergedBody, file.Entry.MTime, backup, "writing merged file"); err != nil {
-		return localFileUnchanged, err
+		return localFileUnchanged, false, err
 	}
-	if err := writeMergeBase(path, file.Body); err != nil {
-		return localFileUnchanged, err
+	baseCopied, err := writeMergeBase(path, file.Body)
+	if err != nil {
+		return localFileUnchanged, false, err
 	}
 
 	if conflicted {
-		return localFileConflict, nil
+		return localFileConflict, baseCopied, nil
 	}
 
-	return localFileMerged, nil
+	return localFileMerged, baseCopied, nil
 }
 
 func isTextFileForMerge(path string, localBody []byte, baseBody []byte, remoteBody []byte) bool {

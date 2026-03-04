@@ -62,6 +62,7 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 			pathsToFetch := make([]string, 0, len(snapshot.Entries))
 			alreadyUpToDate := 0
 			metadataUpdated := 0
+			basesCopied := 0
 			for _, entry := range snapshot.Entries {
 				if entry.Folder {
 					continue
@@ -82,8 +83,12 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				}
 				if upToDate {
 					if !rt.IsDryRun() && entry.Hash != "" {
-						if err := ensureMergeBaseFromLocal(targetPath, entry.Hash); err != nil {
+						baseCopied, err := ensureMergeBaseFromLocal(targetPath, entry.Hash)
+						if err != nil {
 							return err
+						}
+						if baseCopied {
+							basesCopied++
 						}
 					}
 					if metadataOnly {
@@ -145,7 +150,7 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					}
 				}
 
-				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated)
+				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated, basesCopied)
 				logger.Info("no remote files to fetch")
 				return nil
 			}
@@ -160,7 +165,7 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 						logger.Info("would delete unknown local files", "count", deleted)
 					}
 				}
-				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated)
+				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated, basesCopied)
 				return nil
 			}
 
@@ -175,16 +180,20 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 
 			for _, file := range files {
 				var status localFileWriteStatus
+				var baseCopied bool
 				if merge {
-					status, err = writeMergedFile(logger, file.Entry.Path, file, backup)
+					status, baseCopied, err = writeMergedFile(logger, file.Entry.Path, file, backup)
 				} else {
 					status, err = writePulledFile(logger, file.Entry.Path, file, backup)
 					if err == nil {
-						err = writeMergeBase(file.Entry.Path, file.Body)
+						baseCopied, err = writeMergeBase(file.Entry.Path, file.Body)
 					}
 				}
 				if err != nil {
 					return err
+				}
+				if baseCopied {
+					basesCopied++
 				}
 
 				switch status {
@@ -215,7 +224,7 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				}
 			}
 
-			logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated)
+			logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated, basesCopied)
 
 			return nil
 		},

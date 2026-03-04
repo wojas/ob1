@@ -63,6 +63,7 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 			pathsToFetch := make([]string, 0, len(args))
 			alreadyUpToDate := 0
 			metadataUpdated := 0
+			basesCopied := 0
 			for _, arg := range args {
 				targetPath, ok := safeLocalTarget(arg)
 				if !ok {
@@ -84,8 +85,12 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				}
 				if upToDate {
 					if !rt.IsDryRun() && entry.Hash != "" {
-						if err := ensureMergeBaseFromLocal(targetPath, entry.Hash); err != nil {
+						baseCopied, err := ensureMergeBaseFromLocal(targetPath, entry.Hash)
+						if err != nil {
 							return err
+						}
+						if baseCopied {
+							basesCopied++
 						}
 					}
 					if metadataOnly {
@@ -117,7 +122,7 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 			}
 
 			if len(pathsToFetch) == 0 {
-				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated)
+				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated, basesCopied)
 				return nil
 			}
 
@@ -125,7 +130,7 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				for _, path := range pathsToFetch {
 					logger.Info("would fetch file", "path", path)
 				}
-				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated)
+				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated, basesCopied)
 				return nil
 			}
 
@@ -140,16 +145,20 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 
 			for _, file := range files {
 				var status localFileWriteStatus
+				var baseCopied bool
 				if merge {
-					status, err = writeMergedFile(logger, file.Entry.Path, file, nil)
+					status, baseCopied, err = writeMergedFile(logger, file.Entry.Path, file, nil)
 				} else {
 					status, err = writeLocalFile(file.Entry.Path, file)
 					if err == nil {
-						err = writeMergeBase(file.Entry.Path, file.Body)
+						baseCopied, err = writeMergeBase(file.Entry.Path, file.Body)
 					}
 				}
 				if err != nil {
 					return err
+				}
+				if baseCopied {
+					basesCopied++
 				}
 
 				switch status {
@@ -170,7 +179,7 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				}
 			}
 
-			logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated)
+			logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated, basesCopied)
 
 			return nil
 		},
