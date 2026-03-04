@@ -3,6 +3,7 @@ package vaultcrypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -82,6 +83,17 @@ func DecodeMetadata(rawKey []byte, salt string, encryptionVersion int, encoded s
 	}
 }
 
+func EncodeMetadata(rawKey []byte, salt string, encryptionVersion int, plaintext string) (string, error) {
+	switch encryptionVersion {
+	case 0:
+		return encodeMetadataV0(rawKey, plaintext)
+	case 2, 3:
+		return encodeMetadataSIV(rawKey, salt, plaintext)
+	default:
+		return "", fmt.Errorf("unsupported encryption version %d", encryptionVersion)
+	}
+}
+
 func DecodeFileBody(rawKey []byte, encryptionVersion int, body []byte) ([]byte, error) {
 	if len(body) == 0 {
 		return nil, nil
@@ -99,6 +111,82 @@ func DecodeFileBody(rawKey []byte, encryptionVersion int, body []byte) ([]byte, 
 	default:
 		return nil, fmt.Errorf("unsupported encryption version %d", encryptionVersion)
 	}
+}
+
+func EncodeFileBody(rawKey []byte, encryptionVersion int, body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return nil, nil
+	}
+
+	switch encryptionVersion {
+	case 0:
+		return encryptGCM(rawKey, body)
+	case 2, 3:
+		contentKey, err := hkdfBytes(rawKey, "", "ObsidianAesGcm", keySize)
+		if err != nil {
+			return nil, err
+		}
+		return encryptGCM(contentKey, body)
+	default:
+		return nil, fmt.Errorf("unsupported encryption version %d", encryptionVersion)
+	}
+}
+
+func PlaintextHash(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
+
+func encodeMetadataV0(rawKey []byte, plaintext string) (string, error) {
+	plain := []byte(plaintext)
+	sum := sha256.Sum256(plain)
+	nonce := sum[:12]
+
+	block, err := aes.NewCipher(rawKey)
+	if err != nil {
+		return "", fmt.Errorf("create AES cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("create GCM: %w", err)
+	}
+
+	ciphertext := gcm.Seal(nil, nonce, plain, nil)
+	out := append(append([]byte{}, nonce...), ciphertext...)
+	return hex.EncodeToString(out), nil
+}
+
+func encodeMetadataSIV(rawKey []byte, salt string, plaintext string) (string, error) {
+	encKey, err := hkdfBytes(rawKey, norm.NFKC.String(salt), "ObsidianAesSivEnc", keySize)
+	if err != nil {
+		return "", err
+	}
+	macKey, err := hkdfBytes(rawKey, norm.NFKC.String(salt), "ObsidianAesSivMac", keySize)
+	if err != nil {
+		return "", err
+	}
+
+	plain := []byte(plaintext)
+	tag, err := s2v(macKey, plain)
+	if err != nil {
+		return "", err
+	}
+
+	iv := append([]byte(nil), tag...)
+	iv[len(iv)-8] &= 0x7f
+	iv[len(iv)-4] &= 0x7f
+
+	block, err := aes.NewCipher(encKey)
+	if err != nil {
+		return "", fmt.Errorf("create AES cipher: %w", err)
+	}
+
+	ciphertext := make([]byte, len(plain))
+	cipher.NewCTR(block, iv).XORKeyStream(ciphertext, plain)
+
+	out := append(append([]byte{}, tag...), ciphertext...)
+	return hex.EncodeToString(out), nil
 }
 
 func decodeMetadataV0(rawKey []byte, encoded string) (string, error) {
@@ -294,4 +382,24 @@ func decryptGCM(key []byte, body []byte) ([]byte, error) {
 	}
 
 	return plaintext, nil
+}
+
+func encryptGCM(key []byte, body []byte) ([]byte, error) {
+	nonce := make([]byte, 12)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("read random nonce: %w", err)
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("create AES cipher: %w", err)
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("create GCM: %w", err)
+	}
+
+	ciphertext := gcm.Seal(nil, nonce, body, nil)
+	return append(nonce, ciphertext...), nil
 }

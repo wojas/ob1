@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"path"
 	"sort"
 	"strings"
 
@@ -22,6 +23,7 @@ type Entry struct {
 	Size   int64
 	CTime  int64
 	MTime  int64
+	Hash   string
 	Device string
 	Folder bool
 }
@@ -54,11 +56,32 @@ type pushMessage struct {
 	UID     int64  `json:"uid"`
 	Path    string `json:"path"`
 	Size    int64  `json:"size"`
+	Hash    string `json:"hash"`
 	CTime   int64  `json:"ctime"`
 	MTime   int64  `json:"mtime"`
 	Device  string `json:"device"`
 	Folder  bool   `json:"folder"`
 	Deleted bool   `json:"deleted"`
+}
+
+type pushRequest struct {
+	Op          string  `json:"op"`
+	Path        string  `json:"path"`
+	RelatedPath *string `json:"relatedpath"`
+	Extension   string  `json:"extension"`
+	Hash        string  `json:"hash"`
+	CTime       int64   `json:"ctime"`
+	MTime       int64   `json:"mtime"`
+	Folder      bool    `json:"folder"`
+	Deleted     bool    `json:"deleted"`
+	Size        int64   `json:"size,omitempty"`
+	Pieces      int     `json:"pieces,omitempty"`
+}
+
+type Upload struct {
+	Path  string
+	Body  []byte
+	MTime int64
 }
 
 type pullRequest struct {
@@ -151,7 +174,7 @@ func pullFile(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state va
 		return nil, err
 	}
 
-	responseBody, err := readJSONMessage(logger, conn)
+	responseBody, err := readCommandResponse(logger, conn)
 	if err != nil {
 		return nil, err
 	}
@@ -289,10 +312,19 @@ func snapshotEntries(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, s
 				return nil, fmt.Errorf("decode remote path for uid %d: %w", push.UID, err)
 			}
 
+			hash := ""
+			if strings.TrimSpace(push.Hash) != "" {
+				hash, err = vaultcrypto.DecodeMetadata(rawKey, state.Salt, state.EncryptionVersion, push.Hash)
+				if err != nil {
+					return nil, fmt.Errorf("decode remote hash for uid %d: %w", push.UID, err)
+				}
+			}
+
 			entriesByUID[push.UID] = Entry{
 				Path:   path,
 				UID:    push.UID,
 				Size:   push.Size,
+				Hash:   hash,
 				CTime:  push.CTime,
 				MTime:  push.MTime,
 				Device: push.Device,
@@ -366,6 +398,28 @@ func readJSONMessage(logger *slog.Logger, conn *websocket.Conn) ([]byte, error) 
 	return body, nil
 }
 
+func readCommandResponse(logger *slog.Logger, conn *websocket.Conn) ([]byte, error) {
+	for {
+		body, err := readJSONMessage(logger, conn)
+		if err != nil {
+			return nil, err
+		}
+
+		var msg serverMessage
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return body, nil
+		}
+
+		switch msg.Op {
+		case "pong", "push", "ready":
+			logger.Debug("skipping event while awaiting command response", "op", msg.Op)
+			continue
+		default:
+			return body, nil
+		}
+	}
+}
+
 func websocketURL(host string) (string, error) {
 	trimmed := strings.TrimSpace(host)
 	if trimmed == "" {
@@ -400,4 +454,211 @@ func prettyJSON(body []byte) string {
 	}
 
 	return string(encoded)
+}
+
+func PutFiles(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, uploads []Upload) error {
+	if strings.TrimSpace(token) == "" {
+		return errors.New("missing auth token")
+	}
+
+	rawKey, conn, err := dialAndInit(ctx, logger, token, state)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	entries, err := snapshotEntries(logger, conn, rawKey, state)
+	if err != nil {
+		return err
+	}
+
+	entriesByPath := make(map[string]Entry, len(entries))
+	for _, entry := range entries {
+		entriesByPath[entry.Path] = entry
+	}
+
+	if err := ensureRemoteDirectories(logger, conn, rawKey, state, entriesByPath, uploads); err != nil {
+		return err
+	}
+
+	for _, upload := range uploads {
+		if err := putSingleFile(logger, conn, rawKey, state, entriesByPath, upload); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func ensureRemoteDirectories(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state vaultstore.VaultState, entriesByPath map[string]Entry, uploads []Upload) error {
+	required := make(map[string]struct{})
+	for _, upload := range uploads {
+		dir := path.Dir(upload.Path)
+		for dir != "." && dir != "/" {
+			required[dir] = struct{}{}
+			dir = path.Dir(dir)
+		}
+	}
+
+	dirs := make([]string, 0, len(required))
+	for dir := range required {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+
+	for _, dir := range dirs {
+		if existing, ok := entriesByPath[dir]; ok {
+			if !existing.Folder {
+				return fmt.Errorf("remote path %q exists as a file", dir)
+			}
+			continue
+		}
+
+		encodedPath, err := vaultcrypto.EncodeMetadata(rawKey, state.Salt, state.EncryptionVersion, dir)
+		if err != nil {
+			return fmt.Errorf("encode folder path %q: %w", dir, err)
+		}
+
+		if err := sendPush(logger, conn, pushRequest{
+			Op:        "push",
+			Path:      encodedPath,
+			Extension: "",
+			Hash:      "",
+			CTime:     0,
+			MTime:     0,
+			Folder:    true,
+			Deleted:   false,
+		}, nil); err != nil {
+			return fmt.Errorf("create remote folder %q: %w", dir, err)
+		}
+
+		entriesByPath[dir] = Entry{Path: dir, Folder: true}
+	}
+
+	return nil
+}
+
+func putSingleFile(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state vaultstore.VaultState, entriesByPath map[string]Entry, upload Upload) error {
+	existing, exists := entriesByPath[upload.Path]
+	if exists && existing.Folder {
+		return fmt.Errorf("remote path %q exists as a folder", upload.Path)
+	}
+
+	hashHex := vaultcrypto.PlaintextHash(upload.Body)
+	if exists && existing.Hash == hashHex {
+		logger.Info("skipping unchanged file", "path", upload.Path)
+		return nil
+	}
+
+	encodedPath, err := vaultcrypto.EncodeMetadata(rawKey, state.Salt, state.EncryptionVersion, upload.Path)
+	if err != nil {
+		return fmt.Errorf("encode file path %q: %w", upload.Path, err)
+	}
+
+	encodedHash, err := vaultcrypto.EncodeMetadata(rawKey, state.Salt, state.EncryptionVersion, hashHex)
+	if err != nil {
+		return fmt.Errorf("encode file hash %q: %w", upload.Path, err)
+	}
+
+	encryptedBody, err := vaultcrypto.EncodeFileBody(rawKey, state.EncryptionVersion, upload.Body)
+	if err != nil {
+		return fmt.Errorf("encrypt file body %q: %w", upload.Path, err)
+	}
+
+	ctime := upload.MTime
+	if exists && existing.CTime > 0 {
+		ctime = existing.CTime
+	}
+
+	extension := strings.TrimPrefix(path.Ext(upload.Path), ".")
+	const pieceSize = 2 * 1024 * 1024
+	pieces := 0
+	if len(encryptedBody) > 0 {
+		pieces = (len(encryptedBody) + pieceSize - 1) / pieceSize
+	}
+
+	if err := sendPush(logger, conn, pushRequest{
+		Op:        "push",
+		Path:      encodedPath,
+		Extension: extension,
+		Hash:      encodedHash,
+		CTime:     ctime,
+		MTime:     upload.MTime,
+		Folder:    false,
+		Deleted:   false,
+		Size:      int64(len(encryptedBody)),
+		Pieces:    pieces,
+	}, encryptedBody); err != nil {
+		return fmt.Errorf("upload %q: %w", upload.Path, err)
+	}
+
+	entriesByPath[upload.Path] = Entry{
+		Path:   upload.Path,
+		Size:   int64(len(upload.Body)),
+		Hash:   hashHex,
+		CTime:  ctime,
+		MTime:  upload.MTime,
+		Folder: false,
+	}
+	logger.Info("uploaded file", "path", upload.Path, "bytes", len(upload.Body))
+
+	return nil
+}
+
+func sendPush(logger *slog.Logger, conn *websocket.Conn, req pushRequest, encryptedBody []byte) error {
+	if err := writeJSONMessage(logger, conn, req); err != nil {
+		return err
+	}
+
+	responseBody, err := readCommandResponse(logger, conn)
+	if err != nil {
+		return err
+	}
+
+	var response serverMessage
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		return fmt.Errorf("decode push response: %w", err)
+	}
+	if response.Status == "err" || response.Res == "err" {
+		if strings.TrimSpace(response.Msg) == "" {
+			return errors.New("push failed")
+		}
+		return errors.New(strings.TrimSpace(response.Msg))
+	}
+
+	if response.Res == "ok" || len(encryptedBody) == 0 {
+		return nil
+	}
+
+	const pieceSize = 2 * 1024 * 1024
+	for start := 0; start < len(encryptedBody); start += pieceSize {
+		end := start + pieceSize
+		if end > len(encryptedBody) {
+			end = len(encryptedBody)
+		}
+
+		chunk := encryptedBody[start:end]
+		logger.Debug("websocket send binary", "bytes", len(chunk))
+		if err := conn.WriteMessage(websocket.BinaryMessage, chunk); err != nil {
+			return fmt.Errorf("send push chunk: %w", err)
+		}
+
+		ackBody, err := readCommandResponse(logger, conn)
+		if err != nil {
+			return err
+		}
+
+		var ack serverMessage
+		if err := json.Unmarshal(ackBody, &ack); err != nil {
+			return fmt.Errorf("decode push chunk response: %w", err)
+		}
+		if ack.Status == "err" || ack.Res == "err" {
+			if strings.TrimSpace(ack.Msg) == "" {
+				return errors.New("push chunk failed")
+			}
+			return errors.New(strings.TrimSpace(ack.Msg))
+		}
+	}
+
+	return nil
 }
