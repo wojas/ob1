@@ -61,6 +61,7 @@ func run() int {
 
 	root.AddCommand(newLoginCommand(app, &apiBase, &debug))
 	root.AddCommand(newCatCommand(app, &debug))
+	root.AddCommand(newGetCommand(app, &debug))
 	root.AddCommand(newInfoCommand(app, &apiBase, &debug))
 	root.AddCommand(newListRemoteCommand(app, &debug))
 	root.AddCommand(newLogoutCommand(app, &apiBase, &debug))
@@ -232,6 +233,56 @@ func newCatCommand(app *app, debug *bool) *cobra.Command {
 
 			if _, err := os.Stdout.Write(body); err != nil {
 				return fmt.Errorf("write file to stdout: %w", err)
+			}
+
+			return nil
+		},
+	}
+}
+
+func newGetCommand(app *app, debug *bool) *cobra.Command {
+	return &cobra.Command{
+		Use:   "get <file1> [file2] [fileN]",
+		Short: "Fetch remote files into the current directory",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			app.logger = newLogger(*debug)
+
+			userState, err := app.store.Load()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("no local session found; login first")
+				}
+
+				return err
+			}
+
+			vaultState, err := vaultstore.NewInDir(".").Load()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return errors.New("no local vault config found; run `ob1 vault setup <id>` first")
+				}
+
+				return err
+			}
+
+			files, err := remotelist.ReadFiles(cmd.Context(), app.logger, userState.Token, vaultState, args)
+			if err != nil {
+				return err
+			}
+
+			for _, file := range files {
+				targetPath, ok := safeLocalTarget(file.Entry.Path)
+				if !ok {
+					app.logger.Warn("skipping dangerous path", "path", file.Entry.Path)
+					continue
+				}
+
+				if err := writeLocalFile(targetPath, file); err != nil {
+					return err
+				}
+
+				app.logger.Info("fetched file", "path", targetPath, "bytes", len(file.Body))
 			}
 
 			return nil
@@ -567,7 +618,7 @@ func writeRemoteEntryTable(out *os.File, entries []remotelist.Entry) error {
 	})
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "PATH\tTYPE\tSIZE\tUID\tMTIME\tDEVICE"); err != nil {
+	if _, err := fmt.Fprintln(w, "PATH\tTYPE\tSIZE\tUID\tCTIME\tMTIME\tDEVICE"); err != nil {
 		return fmt.Errorf("write remote table header: %w", err)
 	}
 
@@ -581,11 +632,12 @@ func writeRemoteEntryTable(out *os.File, entries []remotelist.Entry) error {
 
 		if _, err := fmt.Fprintf(
 			w,
-			"%s\t%s\t%s\t%d\t%s\t%s\n",
+			"%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
 			displayOrDash(entry.Path),
 			entryType,
 			size,
 			entry.UID,
+			formatUnixMillis(entry.CTime),
 			formatUnixMillis(entry.MTime),
 			displayOrDash(entry.Device),
 		); err != nil {
@@ -594,7 +646,7 @@ func writeRemoteEntryTable(out *os.File, entries []remotelist.Entry) error {
 	}
 
 	if len(sorted) == 0 {
-		if _, err := fmt.Fprintln(w, "(none)\t\t\t\t\t"); err != nil {
+		if _, err := fmt.Fprintln(w, "(none)\t\t\t\t\t\t"); err != nil {
 			return fmt.Errorf("write empty remote table: %w", err)
 		}
 	}
@@ -662,4 +714,55 @@ func formatUnixMillis(ms int64) string {
 	}
 
 	return time.UnixMilli(ms).UTC().Format(time.RFC3339)
+}
+
+func safeLocalTarget(remotePath string) (string, bool) {
+	trimmed := strings.TrimSpace(remotePath)
+	if trimmed == "" {
+		return "", false
+	}
+
+	cleaned := filepath.Clean(trimmed)
+	if cleaned == "." {
+		return "", false
+	}
+	if filepath.IsAbs(cleaned) {
+		return "", false
+	}
+	if cleaned == ".." {
+		return "", false
+	}
+
+	parentPrefix := ".." + string(filepath.Separator)
+	if strings.HasPrefix(cleaned, parentPrefix) {
+		return "", false
+	}
+
+	if vol := filepath.VolumeName(cleaned); vol != "" {
+		return "", false
+	}
+
+	return cleaned, true
+}
+
+func writeLocalFile(path string, file remotelist.File) error {
+	dir := filepath.Dir(path)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create directories for %s: %w", path, err)
+		}
+	}
+
+	if err := os.WriteFile(path, file.Body, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+
+	if file.Entry.MTime > 0 {
+		mtime := time.UnixMilli(file.Entry.MTime)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			return fmt.Errorf("set timestamps on %s: %w", path, err)
+		}
+	}
+
+	return nil
 }

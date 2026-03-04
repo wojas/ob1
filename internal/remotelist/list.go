@@ -20,9 +20,15 @@ type Entry struct {
 	Path   string
 	UID    int64
 	Size   int64
+	CTime  int64
 	MTime  int64
 	Device string
 	Folder bool
+}
+
+type File struct {
+	Entry Entry
+	Body  []byte
 }
 
 type initMessage struct {
@@ -48,6 +54,7 @@ type pushMessage struct {
 	UID     int64  `json:"uid"`
 	Path    string `json:"path"`
 	Size    int64  `json:"size"`
+	CTime   int64  `json:"ctime"`
 	MTime   int64  `json:"mtime"`
 	Device  string `json:"device"`
 	Folder  bool   `json:"folder"`
@@ -80,6 +87,18 @@ func Snapshot(ctx context.Context, logger *slog.Logger, token string, state vaul
 }
 
 func ReadFile(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, targetPath string) ([]byte, error) {
+	files, err := ReadFiles(ctx, logger, token, state, []string{targetPath})
+	if err != nil {
+		return nil, err
+	}
+	if len(files) != 1 {
+		return nil, fmt.Errorf("remote file %q not found", targetPath)
+	}
+
+	return files[0].Body, nil
+}
+
+func ReadFiles(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, targetPaths []string) ([]File, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("missing auth token")
 	}
@@ -95,23 +114,39 @@ func ReadFile(ctx context.Context, logger *slog.Logger, token string, state vaul
 		return nil, err
 	}
 
-	var target *Entry
-	for i := range entries {
-		if entries[i].Path == targetPath {
-			target = &entries[i]
-			break
-		}
-	}
-	if target == nil {
-		return nil, fmt.Errorf("remote file %q not found", targetPath)
-	}
-	if target.Folder {
-		return nil, fmt.Errorf("%q is a folder", targetPath)
+	entriesByPath := make(map[string]Entry, len(entries))
+	for _, entry := range entries {
+		entriesByPath[entry.Path] = entry
 	}
 
+	files := make([]File, 0, len(targetPaths))
+	for _, targetPath := range targetPaths {
+		entry, ok := entriesByPath[targetPath]
+		if !ok {
+			return nil, fmt.Errorf("remote file %q not found", targetPath)
+		}
+		if entry.Folder {
+			return nil, fmt.Errorf("%q is a folder", targetPath)
+		}
+
+		body, err := pullFile(logger, conn, rawKey, state, targetPath, entry.UID)
+		if err != nil {
+			return nil, err
+		}
+
+		files = append(files, File{
+			Entry: entry,
+			Body:  body,
+		})
+	}
+
+	return files, nil
+}
+
+func pullFile(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state vaultstore.VaultState, targetPath string, uid int64) ([]byte, error) {
 	if err := writeJSONMessage(logger, conn, pullRequest{
 		Op:  "pull",
-		UID: target.UID,
+		UID: uid,
 	}); err != nil {
 		return nil, err
 	}
@@ -258,6 +293,7 @@ func snapshotEntries(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, s
 				Path:   path,
 				UID:    push.UID,
 				Size:   push.Size,
+				CTime:  push.CTime,
 				MTime:  push.MTime,
 				Device: push.Device,
 				Folder: push.Folder,
