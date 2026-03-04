@@ -301,11 +301,19 @@ func newGetCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 					continue
 				}
 
-				if err := writeLocalFile(targetPath, file); err != nil {
+				status, err := writeLocalFile(targetPath, file)
+				if err != nil {
 					return err
 				}
 
-				app.logger.Info("fetched file", "path", targetPath, "bytes", len(file.Body))
+				switch status {
+				case localFileUnchanged:
+					app.logger.Info("file already up to date", "path", targetPath)
+				case localFileMetadataOnly:
+					app.logger.Info("updated file metadata", "path", targetPath)
+				default:
+					app.logger.Info("fetched file", "path", targetPath, "bytes", len(file.Body))
+				}
 			}
 
 			return nil
@@ -871,26 +879,76 @@ func safeLocalTarget(remotePath string) (string, bool) {
 	return cleaned, true
 }
 
-func writeLocalFile(path string, file remotelist.File) error {
+type localFileWriteStatus int
+
+const (
+	localFileUnchanged localFileWriteStatus = iota
+	localFileMetadataOnly
+	localFileContentUpdated
+)
+
+func writeLocalFile(path string, file remotelist.File) (localFileWriteStatus, error) {
 	dir := filepath.Dir(path)
 	if dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("create directories for %s: %w", path, err)
+			return localFileUnchanged, fmt.Errorf("create directories for %s: %w", path, err)
 		}
+	}
+
+	remoteHash := strings.TrimSpace(file.Entry.Hash)
+	if remoteHash == "" {
+		remoteHash = vaultcrypto.PlaintextHash(file.Body)
+	}
+
+	existingBody, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if vaultcrypto.PlaintextHash(existingBody) == remoteHash {
+			updated, err := updateLocalFileTimes(path, file.Entry.MTime)
+			if err != nil {
+				return localFileUnchanged, err
+			}
+			if updated {
+				return localFileMetadataOnly, nil
+			}
+			return localFileUnchanged, nil
+		}
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return localFileUnchanged, fmt.Errorf("read %s: %w", path, err)
 	}
 
 	if err := os.WriteFile(path, file.Body, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
+		return localFileUnchanged, fmt.Errorf("write %s: %w", path, err)
 	}
 
-	if file.Entry.MTime > 0 {
-		mtime := time.UnixMilli(file.Entry.MTime)
-		if err := os.Chtimes(path, mtime, mtime); err != nil {
-			return fmt.Errorf("set timestamps on %s: %w", path, err)
-		}
+	if _, err := updateLocalFileTimes(path, file.Entry.MTime); err != nil {
+		return localFileUnchanged, err
 	}
 
-	return nil
+	return localFileContentUpdated, nil
+}
+
+func updateLocalFileTimes(path string, mtimeMs int64) (bool, error) {
+	if mtimeMs <= 0 {
+		return false, nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	mtime := time.UnixMilli(mtimeMs)
+	if info.ModTime().Equal(mtime) {
+		return false, nil
+	}
+
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		return false, fmt.Errorf("set timestamps on %s: %w", path, err)
+	}
+
+	return true, nil
 }
 
 func loadRemoteCache(store *remotelist.CacheStore, noCache bool) (*remotelist.CacheState, error) {
