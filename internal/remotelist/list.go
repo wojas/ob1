@@ -10,6 +10,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -18,14 +19,15 @@ import (
 )
 
 type Entry struct {
-	Path   string
-	UID    int64
-	Size   int64
-	CTime  int64
-	MTime  int64
-	Hash   string
-	Device string
-	Folder bool
+	Path   string                     `json:"path"`
+	UID    int64                      `json:"uid"`
+	Size   int64                      `json:"size"`
+	CTime  int64                      `json:"ctime"`
+	MTime  int64                      `json:"mtime"`
+	Hash   string                     `json:"hash"`
+	Device string                     `json:"device"`
+	Folder bool                       `json:"folder"`
+	Extra  map[string]json.RawMessage `json:"-"`
 }
 
 type File struct {
@@ -96,45 +98,81 @@ type pullResponse struct {
 }
 
 func Snapshot(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState) ([]Entry, error) {
-	if strings.TrimSpace(token) == "" {
-		return nil, errors.New("missing auth token")
-	}
-
-	rawKey, conn, err := dialAndInit(ctx, logger, token, state)
+	snapshot, err := SyncEntries(ctx, logger, token, state, nil, false)
 	if err != nil {
 		return nil, err
+	}
+
+	return snapshot.Entries, nil
+}
+
+func SyncEntries(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, cached *CacheState, useCache bool) (CacheState, error) {
+	if strings.TrimSpace(token) == "" {
+		return CacheState{}, errors.New("missing auth token")
+	}
+
+	startVersion := int64(0)
+	initial := true
+	baselineEntries := []Entry(nil)
+	if useCache && cached != nil {
+		startVersion = cached.Version
+		initial = false
+		baselineEntries = append([]Entry(nil), cached.Entries...)
+	}
+
+	rawKey, conn, err := dialAndInit(ctx, logger, token, state, startVersion, initial)
+	if err != nil {
+		return CacheState{}, err
 	}
 	defer conn.Close()
 
-	return snapshotEntries(logger, conn, rawKey, state)
+	entries, version, err := snapshotEntries(logger, conn, rawKey, state, baselineEntries)
+	if err != nil {
+		return CacheState{}, err
+	}
+
+	return CacheState{
+		Version: version,
+		Entries: entries,
+		SavedAt: time.Now().UTC(),
+	}, nil
 }
 
-func ReadFile(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, targetPath string) ([]byte, error) {
-	files, err := ReadFiles(ctx, logger, token, state, []string{targetPath})
+func ReadFile(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, targetPath string, cached *CacheState, useCache bool) ([]byte, CacheState, error) {
+	files, snapshot, err := ReadFiles(ctx, logger, token, state, []string{targetPath}, cached, useCache)
 	if err != nil {
-		return nil, err
+		return nil, CacheState{}, err
 	}
 	if len(files) != 1 {
-		return nil, fmt.Errorf("remote file %q not found", targetPath)
+		return nil, CacheState{}, fmt.Errorf("remote file %q not found", targetPath)
 	}
 
-	return files[0].Body, nil
+	return files[0].Body, snapshot, nil
 }
 
-func ReadFiles(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, targetPaths []string) ([]File, error) {
+func ReadFiles(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, targetPaths []string, cached *CacheState, useCache bool) ([]File, CacheState, error) {
 	if strings.TrimSpace(token) == "" {
-		return nil, errors.New("missing auth token")
+		return nil, CacheState{}, errors.New("missing auth token")
 	}
 
-	rawKey, conn, err := dialAndInit(ctx, logger, token, state)
+	startVersion := int64(0)
+	initial := true
+	baselineEntries := []Entry(nil)
+	if useCache && cached != nil {
+		startVersion = cached.Version
+		initial = false
+		baselineEntries = append([]Entry(nil), cached.Entries...)
+	}
+
+	rawKey, conn, err := dialAndInit(ctx, logger, token, state, startVersion, initial)
 	if err != nil {
-		return nil, err
+		return nil, CacheState{}, err
 	}
 	defer conn.Close()
 
-	entries, err := snapshotEntries(logger, conn, rawKey, state)
+	entries, version, err := snapshotEntries(logger, conn, rawKey, state, baselineEntries)
 	if err != nil {
-		return nil, err
+		return nil, CacheState{}, err
 	}
 
 	entriesByPath := make(map[string]Entry, len(entries))
@@ -146,15 +184,15 @@ func ReadFiles(ctx context.Context, logger *slog.Logger, token string, state vau
 	for _, targetPath := range targetPaths {
 		entry, ok := entriesByPath[targetPath]
 		if !ok {
-			return nil, fmt.Errorf("remote file %q not found", targetPath)
+			return nil, CacheState{}, fmt.Errorf("remote file %q not found", targetPath)
 		}
 		if entry.Folder {
-			return nil, fmt.Errorf("%q is a folder", targetPath)
+			return nil, CacheState{}, fmt.Errorf("%q is a folder", targetPath)
 		}
 
 		body, err := pullFile(logger, conn, rawKey, state, targetPath, entry.UID)
 		if err != nil {
-			return nil, err
+			return nil, CacheState{}, err
 		}
 
 		files = append(files, File{
@@ -163,7 +201,11 @@ func ReadFiles(ctx context.Context, logger *slog.Logger, token string, state vau
 		})
 	}
 
-	return files, nil
+	return files, CacheState{
+		Version: version,
+		Entries: entries,
+		SavedAt: time.Now().UTC(),
+	}, nil
 }
 
 func pullFile(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state vaultstore.VaultState, targetPath string, uid int64) ([]byte, error) {
@@ -228,7 +270,7 @@ func pullFile(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state va
 	return vaultcrypto.DecodeFileBody(rawKey, state.EncryptionVersion, encrypted)
 }
 
-func dialAndInit(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState) ([]byte, *websocket.Conn, error) {
+func dialAndInit(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, version int64, initial bool) ([]byte, *websocket.Conn, error) {
 	rawKey, err := vaultcrypto.DecodeKey(state.EncryptionKey)
 	if err != nil {
 		return nil, nil, err
@@ -250,8 +292,8 @@ func dialAndInit(ctx context.Context, logger *slog.Logger, token string, state v
 		Token:             token,
 		ID:                state.VaultID,
 		KeyHash:           state.KeyHash,
-		Version:           0,
-		Initial:           true,
+		Version:           version,
+		Initial:           initial,
 		Device:            state.DeviceName,
 		EncryptionVersion: state.EncryptionVersion,
 	}
@@ -268,23 +310,35 @@ func dialAndInit(ctx context.Context, logger *slog.Logger, token string, state v
 	return rawKey, conn, nil
 }
 
-func snapshotEntries(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state vaultstore.VaultState) ([]Entry, error) {
-	entriesByUID := make(map[int64]Entry)
+func snapshotEntries(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state vaultstore.VaultState, baseline []Entry) ([]Entry, int64, error) {
+	entriesByUID := make(map[int64]Entry, len(baseline))
+	for _, entry := range baseline {
+		entriesByUID[entry.UID] = entry
+	}
+
 	for {
 		payload, err := readJSONMessage(logger, conn)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		var msg serverMessage
 		if err := json.Unmarshal(payload, &msg); err != nil {
-			return nil, fmt.Errorf("decode websocket message: %w", err)
+			return nil, 0, fmt.Errorf("decode websocket message: %w", err)
 		}
 
 		switch msg.Op {
 		case "pong":
 			continue
 		case "ready":
+			var ready struct {
+				Op      string `json:"op"`
+				Version int64  `json:"version"`
+			}
+			if err := json.Unmarshal(payload, &ready); err != nil {
+				return nil, 0, fmt.Errorf("decode ready message: %w", err)
+			}
+
 			entries := make([]Entry, 0, len(entriesByUID))
 			for _, entry := range entriesByUID {
 				entries = append(entries, entry)
@@ -295,11 +349,11 @@ func snapshotEntries(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, s
 				}
 				return entries[i].Path < entries[j].Path
 			})
-			return entries, nil
+			return entries, ready.Version, nil
 		case "push":
 			var push pushMessage
 			if err := json.Unmarshal(payload, &push); err != nil {
-				return nil, fmt.Errorf("decode push message: %w", err)
+				return nil, 0, fmt.Errorf("decode push message: %w", err)
 			}
 
 			if push.Deleted {
@@ -309,17 +363,18 @@ func snapshotEntries(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, s
 
 			path, err := vaultcrypto.DecodeMetadata(rawKey, state.Salt, state.EncryptionVersion, push.Path)
 			if err != nil {
-				return nil, fmt.Errorf("decode remote path for uid %d: %w", push.UID, err)
+				return nil, 0, fmt.Errorf("decode remote path for uid %d: %w", push.UID, err)
 			}
 
 			hash := ""
 			if strings.TrimSpace(push.Hash) != "" {
 				hash, err = vaultcrypto.DecodeMetadata(rawKey, state.Salt, state.EncryptionVersion, push.Hash)
 				if err != nil {
-					return nil, fmt.Errorf("decode remote hash for uid %d: %w", push.UID, err)
+					return nil, 0, fmt.Errorf("decode remote hash for uid %d: %w", push.UID, err)
 				}
 			}
 
+			previous := entriesByUID[push.UID]
 			entriesByUID[push.UID] = Entry{
 				Path:   path,
 				UID:    push.UID,
@@ -329,10 +384,11 @@ func snapshotEntries(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, s
 				MTime:  push.MTime,
 				Device: push.Device,
 				Folder: push.Folder,
+				Extra:  previous.Extra,
 			}
 		default:
 			if msg.Status == "err" || msg.Res == "err" {
-				return nil, errors.New(strings.TrimSpace(msg.Msg))
+				return nil, 0, errors.New(strings.TrimSpace(msg.Msg))
 			}
 		}
 	}
@@ -456,20 +512,29 @@ func prettyJSON(body []byte) string {
 	return string(encoded)
 }
 
-func PutFiles(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, uploads []Upload) error {
+func PutFiles(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, uploads []Upload, cached *CacheState, useCache bool) (CacheState, error) {
 	if strings.TrimSpace(token) == "" {
-		return errors.New("missing auth token")
+		return CacheState{}, errors.New("missing auth token")
 	}
 
-	rawKey, conn, err := dialAndInit(ctx, logger, token, state)
+	startVersion := int64(0)
+	initial := true
+	baselineEntries := []Entry(nil)
+	if useCache && cached != nil {
+		startVersion = cached.Version
+		initial = false
+		baselineEntries = append([]Entry(nil), cached.Entries...)
+	}
+
+	rawKey, conn, err := dialAndInit(ctx, logger, token, state, startVersion, initial)
 	if err != nil {
-		return err
+		return CacheState{}, err
 	}
 	defer conn.Close()
 
-	entries, err := snapshotEntries(logger, conn, rawKey, state)
+	entries, _, err := snapshotEntries(logger, conn, rawKey, state, baselineEntries)
 	if err != nil {
-		return err
+		return CacheState{}, err
 	}
 
 	entriesByPath := make(map[string]Entry, len(entries))
@@ -478,16 +543,36 @@ func PutFiles(ctx context.Context, logger *slog.Logger, token string, state vaul
 	}
 
 	if err := ensureRemoteDirectories(logger, conn, rawKey, state, entriesByPath, uploads); err != nil {
-		return err
+		return CacheState{}, err
 	}
 
 	for _, upload := range uploads {
 		if err := putSingleFile(logger, conn, rawKey, state, entriesByPath, upload); err != nil {
-			return err
+			return CacheState{}, err
 		}
 	}
 
-	return nil
+	updatedEntries := make([]Entry, 0, len(entriesByPath))
+	for _, entry := range entriesByPath {
+		updatedEntries = append(updatedEntries, entry)
+	}
+	sort.Slice(updatedEntries, func(i, j int) bool {
+		if updatedEntries[i].Path == updatedEntries[j].Path {
+			return updatedEntries[i].UID < updatedEntries[j].UID
+		}
+		return updatedEntries[i].Path < updatedEntries[j].Path
+	})
+
+	nextVersion := startVersion
+	if !useCache || cached == nil {
+		nextVersion = 0
+	}
+
+	return CacheState{
+		Version: nextVersion,
+		Entries: updatedEntries,
+		SavedAt: time.Now().UTC(),
+	}, nil
 }
 
 func ensureRemoteDirectories(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state vaultstore.VaultState, entriesByPath map[string]Entry, uploads []Upload) error {

@@ -42,6 +42,7 @@ func run() int {
 	}
 
 	var debug bool
+	var noCache bool
 	var apiBase string
 
 	root := &cobra.Command{
@@ -52,6 +53,7 @@ func run() int {
 	}
 
 	root.PersistentFlags().BoolVarP(&debug, "debug", "v", false, "enable debug logging")
+	root.PersistentFlags().BoolVar(&noCache, "no-cache", false, "skip reading and writing the local remote snapshot cache")
 	root.PersistentFlags().StringVar(&apiBase, "api-base", defaultAPIBase(), "Obsidian API base URL")
 
 	app := &app{
@@ -60,11 +62,11 @@ func run() int {
 	}
 
 	root.AddCommand(newLoginCommand(app, &apiBase, &debug))
-	root.AddCommand(newCatCommand(app, &debug))
-	root.AddCommand(newGetCommand(app, &debug))
+	root.AddCommand(newCatCommand(app, &debug, &noCache))
+	root.AddCommand(newGetCommand(app, &debug, &noCache))
 	root.AddCommand(newInfoCommand(app, &apiBase, &debug))
-	root.AddCommand(newListRemoteCommand(app, &debug))
-	root.AddCommand(newPutCommand(app, &debug))
+	root.AddCommand(newListRemoteCommand(app, &debug, &noCache))
+	root.AddCommand(newPutCommand(app, &debug, &noCache))
 	root.AddCommand(newLogoutCommand(app, &apiBase, &debug))
 	root.AddCommand(newVaultCommand(app, &apiBase, &debug))
 
@@ -201,7 +203,7 @@ func newInfoCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
 	}
 }
 
-func newCatCommand(app *app, debug *bool) *cobra.Command {
+func newCatCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 	return &cobra.Command{
 		Use:   "cat <filename>",
 		Short: "Write a remote file's contents to stdout",
@@ -227,8 +229,18 @@ func newCatCommand(app *app, debug *bool) *cobra.Command {
 				return err
 			}
 
-			body, err := remotelist.ReadFile(cmd.Context(), app.logger, userState.Token, vaultState, args[0])
+			cacheStore := remotelist.NewCacheStore(".")
+			cached, cacheErr := loadRemoteCache(cacheStore, *noCache)
+			if cacheErr != nil {
+				return cacheErr
+			}
+
+			body, snapshot, err := remotelist.ReadFile(cmd.Context(), app.logger, userState.Token, vaultState, args[0], cached, !*noCache)
 			if err != nil {
+				return err
+			}
+
+			if err := maybeSaveRemoteCache(cacheStore, cached, snapshot, *noCache); err != nil {
 				return err
 			}
 
@@ -241,7 +253,7 @@ func newCatCommand(app *app, debug *bool) *cobra.Command {
 	}
 }
 
-func newGetCommand(app *app, debug *bool) *cobra.Command {
+func newGetCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 	return &cobra.Command{
 		Use:   "get <file1> [file2] [fileN]",
 		Short: "Fetch remote files into the current directory",
@@ -267,8 +279,18 @@ func newGetCommand(app *app, debug *bool) *cobra.Command {
 				return err
 			}
 
-			files, err := remotelist.ReadFiles(cmd.Context(), app.logger, userState.Token, vaultState, args)
+			cacheStore := remotelist.NewCacheStore(".")
+			cached, cacheErr := loadRemoteCache(cacheStore, *noCache)
+			if cacheErr != nil {
+				return cacheErr
+			}
+
+			files, snapshot, err := remotelist.ReadFiles(cmd.Context(), app.logger, userState.Token, vaultState, args, cached, !*noCache)
 			if err != nil {
+				return err
+			}
+
+			if err := maybeSaveRemoteCache(cacheStore, cached, snapshot, *noCache); err != nil {
 				return err
 			}
 
@@ -291,7 +313,7 @@ func newGetCommand(app *app, debug *bool) *cobra.Command {
 	}
 }
 
-func newPutCommand(app *app, debug *bool) *cobra.Command {
+func newPutCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
 	return &cobra.Command{
 		Use:   "put <file1> [file2] [...]",
 		Short: "Upload local files into the vault",
@@ -350,17 +372,43 @@ func newPutCommand(app *app, debug *bool) *cobra.Command {
 				return nil
 			}
 
-			return remotelist.PutFiles(cmd.Context(), app.logger, userState.Token, vaultState, uploads)
+			cacheStore := remotelist.NewCacheStore(".")
+			cached, cacheErr := loadRemoteCache(cacheStore, *noCache)
+			if cacheErr != nil {
+				return cacheErr
+			}
+
+			_, err = remotelist.PutFiles(cmd.Context(), app.logger, userState.Token, vaultState, uploads, cached, !*noCache)
+			return err
 		},
 	}
 }
 
-func newListRemoteCommand(app *app, debug *bool) *cobra.Command {
-	return &cobra.Command{
+func newListRemoteCommand(app *app, debug *bool, noCache *bool) *cobra.Command {
+	var cachedOnly bool
+
+	cmd := &cobra.Command{
 		Use:   "list-remote",
 		Short: "List remote vault entries through the sync websocket",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			app.logger = newLogger(*debug)
+
+			cacheStore := remotelist.NewCacheStore(".")
+			if cachedOnly {
+				if *noCache {
+					return errors.New("cannot combine --cached with --no-cache")
+				}
+
+				cached, err := cacheStore.Load()
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						return errors.New("no local cache found")
+					}
+					return err
+				}
+
+				return writeRemoteEntryTable(os.Stdout, cached.Entries)
+			}
 
 			userState, err := app.store.Load()
 			if err != nil {
@@ -380,14 +428,27 @@ func newListRemoteCommand(app *app, debug *bool) *cobra.Command {
 				return err
 			}
 
-			entries, err := remotelist.Snapshot(cmd.Context(), app.logger, userState.Token, vaultState)
+			cached, cacheErr := loadRemoteCache(cacheStore, *noCache)
+			if cacheErr != nil {
+				return cacheErr
+			}
+
+			snapshot, err := remotelist.SyncEntries(cmd.Context(), app.logger, userState.Token, vaultState, cached, !*noCache)
 			if err != nil {
 				return err
 			}
 
-			return writeRemoteEntryTable(os.Stdout, entries)
+			if err := maybeSaveRemoteCache(cacheStore, cached, snapshot, *noCache); err != nil {
+				return err
+			}
+
+			return writeRemoteEntryTable(os.Stdout, snapshot.Entries)
 		},
 	}
+
+	cmd.Flags().BoolVar(&cachedOnly, "cached", false, "only return cached results without contacting the server")
+
+	return cmd
 }
 
 func newVaultCommand(app *app, apiBase *string, debug *bool) *cobra.Command {
@@ -830,4 +891,41 @@ func writeLocalFile(path string, file remotelist.File) error {
 	}
 
 	return nil
+}
+
+func loadRemoteCache(store *remotelist.CacheStore, noCache bool) (*remotelist.CacheState, error) {
+	if noCache {
+		return nil, nil
+	}
+
+	state, err := store.Load()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return &state, nil
+}
+
+func maybeSaveRemoteCache(store *remotelist.CacheStore, previous *remotelist.CacheState, next remotelist.CacheState, noCache bool) error {
+	if noCache {
+		return nil
+	}
+
+	if previous != nil && next.Version <= previous.Version {
+		return nil
+	}
+
+	if previous != nil {
+		if next.SchemaVersion == 0 {
+			next.SchemaVersion = previous.SchemaVersion
+		}
+		if next.Extra == nil && len(previous.Extra) != 0 {
+			next.Extra = previous.Extra
+		}
+	}
+
+	return store.Save(next)
 }
