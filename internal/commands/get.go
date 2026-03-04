@@ -48,7 +48,7 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				return err
 			}
 
-			if err := maybeSaveRemoteCache(cacheStore, cached, snapshot, *noCache); err != nil {
+			if err := maybeSaveRemoteCache(cacheStore, cached, snapshot, effectiveNoCache(*noCache, rt.IsDryRun())); err != nil {
 				return err
 			}
 
@@ -75,14 +75,18 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					return fmt.Errorf("%q is a folder", targetPath)
 				}
 
-				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry)
+				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry, !rt.IsDryRun())
 				if err != nil {
 					return err
 				}
 				if upToDate {
 					if metadataOnly {
 						metadataUpdated++
-						logger.Debug("updated file metadata", "path", targetPath)
+						if rt.IsDryRun() {
+							logger.Debug("file metadata would be updated", "path", targetPath)
+						} else {
+							logger.Debug("updated file metadata", "path", targetPath)
+						}
 					} else {
 						alreadyUpToDate++
 						logger.Debug("file already up to date", "path", targetPath)
@@ -98,12 +102,20 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				return nil
 			}
 
+			if rt.IsDryRun() {
+				for _, path := range pathsToFetch {
+					logger.Info("would fetch file", "path", path)
+				}
+				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated)
+				return nil
+			}
+
 			files, refreshed, err := remotelist.ReadFiles(cmd.Context(), logger, userState.Token, vaultState, pathsToFetch, &snapshot, true)
 			if err != nil {
 				return err
 			}
 
-			if err := maybeSaveRemoteCache(cacheStore, &snapshot, refreshed, *noCache); err != nil {
+			if err := maybeSaveRemoteCache(cacheStore, &snapshot, refreshed, effectiveNoCache(*noCache, rt.IsDryRun())); err != nil {
 				return err
 			}
 

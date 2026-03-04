@@ -14,6 +14,10 @@ func NewLogoutCommand(rt Runtime, apiBase *string, debug *bool) *cobra.Command {
 		Use:   "logout",
 		Short: "Sign out remotely and remove the local auth token",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rt.requireWritable("logout"); err != nil {
+				return err
+			}
+
 			logger := rt.NewLogger(*debug)
 
 			state, err := rt.Store.Load()

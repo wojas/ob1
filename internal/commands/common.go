@@ -27,10 +27,27 @@ import (
 type Runtime struct {
 	Store     *userstore.Store
 	NewLogger func(debug bool) *slog.Logger
+	DryRun    *bool
 }
 
 type backupSession struct {
 	root string
+}
+
+func (rt Runtime) IsDryRun() bool {
+	return rt.DryRun != nil && *rt.DryRun
+}
+
+func (rt Runtime) requireWritable(command string) error {
+	if !rt.IsDryRun() {
+		return nil
+	}
+
+	return fmt.Errorf("--dry-run is not supported for %s", command)
+}
+
+func effectiveNoCache(noCache bool, dryRun bool) bool {
+	return noCache || dryRun
 }
 
 func currentAPIBase(state userstore.UserState, fallback string) string {
@@ -291,7 +308,7 @@ func safeLocalTarget(remotePath string) (string, bool) {
 	return cleaned, true
 }
 
-func localFileMatchesRemote(path string, entry remotelist.Entry) (bool, bool, error) {
+func localFileMatchesRemote(path string, entry remotelist.Entry, applyMetadata bool) (bool, bool, error) {
 	remoteHash := strings.TrimSpace(entry.Hash)
 	if remoteHash == "" {
 		return false, false, nil
@@ -310,12 +327,29 @@ func localFileMatchesRemote(path string, entry remotelist.Entry) (bool, bool, er
 		return false, false, nil
 	}
 
-	updated, err := updateLocalFileTimes(path, entry.MTime)
-	if err != nil {
-		return false, false, err
+	if entry.MTime <= 0 {
+		return true, false, nil
 	}
 
-	return true, updated, nil
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, false, fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	mtime := time.UnixMilli(entry.MTime)
+	if info.ModTime().Equal(mtime) {
+		return true, false, nil
+	}
+
+	if !applyMetadata {
+		return true, true, nil
+	}
+
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		return false, false, fmt.Errorf("set timestamps on %s: %w", path, err)
+	}
+
+	return true, true, nil
 }
 
 type localFileWriteStatus int
@@ -366,28 +400,23 @@ func writeLocalFile(path string, file remotelist.File) (localFileWriteStatus, er
 	return localFileContentUpdated, nil
 }
 
-func writeLocalFileForce(path string, file remotelist.File) error {
-	dir := filepath.Dir(path)
-	if dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("create directories for %s: %w", path, err)
-		}
-	}
-
-	if err := os.WriteFile(path, file.Body, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-
-	if _, err := updateLocalFileTimes(path, file.Entry.MTime); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func warnIfOverwritingLocalChanges(logger *slog.Logger, path string, entry remotelist.Entry) error {
+func warnIfOverwritingLocalChanges(logger *slog.Logger, path string, entry remotelist.Entry, backup *backupSession) error {
 	remoteHash := strings.TrimSpace(entry.Hash)
 	if remoteHash == "" {
+		info, err := os.Lstat(path)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return nil
+		case err != nil:
+			return fmt.Errorf("lstat %s: %w", path, err)
+		}
+
+		if backup != nil {
+			logger.Warn("overwriting local file", "path", path, "backup", backup.target(path))
+		} else if !info.IsDir() {
+			logger.Warn("overwriting local file without backup", "path", path)
+		}
+
 		return nil
 	}
 
@@ -404,7 +433,34 @@ func warnIfOverwritingLocalChanges(logger *slog.Logger, path string, entry remot
 		return nil
 	}
 
-	logger.Warn("overwriting local changes", "path", path)
+	if backup != nil {
+		logger.Warn("overwriting local file", "path", path, "backup", backup.target(path))
+	} else {
+		logger.Warn("overwriting local file without backup", "path", path)
+	}
+
+	return nil
+}
+
+func logDryRunPullAction(logger *slog.Logger, path string, entry remotelist.Entry, backup *backupSession) error {
+	info, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		logger.Info("would fetch file", "path", path)
+		return nil
+	case err != nil:
+		return fmt.Errorf("lstat %s: %w", path, err)
+	}
+
+	if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("%s is a directory", path)
+	}
+
+	if backup != nil {
+		logger.Warn("would overwrite local file", "path", path, "backup", backup.target(path))
+	} else {
+		logger.Warn("would overwrite local file without backup", "path", path)
+	}
 
 	return nil
 }
@@ -573,7 +629,7 @@ func writePulledFile(logger *slog.Logger, path string, file remotelist.File, bac
 	return localFileContentUpdated, nil
 }
 
-func deleteUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry, backup *backupSession) (int, error) {
+func listUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry) ([]string, error) {
 	remoteFiles := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		if entry.Folder {
@@ -588,7 +644,7 @@ func deleteUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry, ba
 		remoteFiles[targetPath] = struct{}{}
 	}
 
-	deleted := 0
+	unknown := make([]string, 0)
 	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -623,27 +679,59 @@ func deleteUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry, ba
 			return err
 		}
 
-		if backup != nil {
-			backupPath, err := backup.move(relPath)
-			if err != nil {
-				return err
-			}
-			logger.Warn("deleting unknown local file", "path", relPath, "backup", backupPath)
-		} else {
-			logger.Warn("deleting unknown local file without backup", "path", relPath)
-			if err := os.Remove(relPath); err != nil {
-				return fmt.Errorf("remove %s: %w", relPath, err)
-			}
-		}
-		deleted++
+		unknown = append(unknown, relPath)
 
 		return nil
 	})
 	if err != nil {
-		return deleted, fmt.Errorf("scan local files for deletion: %w", err)
+		return nil, fmt.Errorf("scan local files for deletion: %w", err)
 	}
 
-	return deleted, nil
+	sort.Strings(unknown)
+
+	return unknown, nil
+}
+
+func deleteUnknownLocalFiles(logger *slog.Logger, entries []remotelist.Entry, backup *backupSession) (int, error) {
+	unknown, err := listUnknownLocalFiles(logger, entries)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, path := range unknown {
+		if backup != nil {
+			backupPath, err := backup.move(path)
+			if err != nil {
+				return 0, err
+			}
+			logger.Warn("deleting unknown local file", "path", path, "backup", backupPath)
+			continue
+		}
+
+		logger.Warn("deleting unknown local file without backup", "path", path)
+		if err := os.Remove(path); err != nil {
+			return 0, fmt.Errorf("remove %s: %w", path, err)
+		}
+	}
+
+	return len(unknown), nil
+}
+
+func logDryRunDeleteUnknown(logger *slog.Logger, entries []remotelist.Entry, backup *backupSession) (int, error) {
+	unknown, err := listUnknownLocalFiles(logger, entries)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, path := range unknown {
+		if backup != nil {
+			logger.Warn("would delete unknown local file", "path", path, "backup", backup.target(path))
+		} else {
+			logger.Warn("would delete unknown local file without backup", "path", path)
+		}
+	}
+
+	return len(unknown), nil
 }
 
 func ensureNoSymlinkAncestor(path string) error {

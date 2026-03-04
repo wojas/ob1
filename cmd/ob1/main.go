@@ -28,6 +28,7 @@ func run() int {
 	}
 
 	var debug bool
+	var dryRun bool
 	var noCache bool
 	var apiBase string
 
@@ -39,12 +40,14 @@ func run() int {
 	}
 
 	root.PersistentFlags().BoolVarP(&debug, "debug", "v", false, "enable debug logging")
+	root.PersistentFlags().BoolVarP(&dryRun, "dry-run", "n", false, "show what would change without making local changes")
 	root.PersistentFlags().BoolVar(&noCache, "no-cache", false, "skip reading and writing the local remote snapshot cache")
 	root.PersistentFlags().StringVar(&apiBase, "api-base", defaultAPIBase(), "Obsidian API base URL")
 
 	runtime := commands.Runtime{
 		Store:     store,
 		NewLogger: newLogger,
+		DryRun:    &dryRun,
 	}
 
 	root.AddCommand(commands.NewLoginCommand(runtime, &apiBase, &debug))

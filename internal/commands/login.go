@@ -18,6 +18,10 @@ func NewLoginCommand(rt Runtime, apiBase *string, debug *bool) *cobra.Command {
 		Use:   "login",
 		Short: "Sign in and persist the auth token locally",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rt.requireWritable("login"); err != nil {
+				return err
+			}
+
 			logger := rt.NewLogger(*debug)
 
 			var err error

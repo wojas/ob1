@@ -53,7 +53,7 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				return err
 			}
 
-			if err := maybeSaveRemoteCache(cacheStore, cached, snapshot, *noCache); err != nil {
+			if err := maybeSaveRemoteCache(cacheStore, cached, snapshot, effectiveNoCache(*noCache, rt.IsDryRun())); err != nil {
 				return err
 			}
 
@@ -74,14 +74,18 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					continue
 				}
 
-				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry)
+				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry, !rt.IsDryRun())
 				if err != nil {
 					return err
 				}
 				if upToDate {
 					if metadataOnly {
 						metadataUpdated++
-						logger.Debug("updated file metadata", "path", targetPath)
+						if rt.IsDryRun() {
+							logger.Debug("file metadata would be updated", "path", targetPath)
+						} else {
+							logger.Debug("updated file metadata", "path", targetPath)
+						}
 					} else {
 						alreadyUpToDate++
 						logger.Debug("file already up to date", "path", targetPath)
@@ -89,7 +93,11 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					continue
 				}
 
-				if err := warnIfOverwritingLocalChanges(logger, targetPath, entry); err != nil {
+				if rt.IsDryRun() {
+					if err := logDryRunPullAction(logger, targetPath, entry, backup); err != nil {
+						return err
+					}
+				} else if err := warnIfOverwritingLocalChanges(logger, targetPath, entry, backup); err != nil {
 					return err
 				}
 
@@ -98,12 +106,22 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 
 			if len(pathsToFetch) == 0 {
 				if deleteUnknown {
-					deleted, err := deleteUnknownLocalFiles(logger, snapshot.Entries, backup)
-					if err != nil {
-						return err
-					}
-					if deleted > 0 {
-						logger.Info("deleted unknown local files", "count", deleted)
+					if rt.IsDryRun() {
+						deleted, err := logDryRunDeleteUnknown(logger, snapshot.Entries, backup)
+						if err != nil {
+							return err
+						}
+						if deleted > 0 {
+							logger.Info("would delete unknown local files", "count", deleted)
+						}
+					} else {
+						deleted, err := deleteUnknownLocalFiles(logger, snapshot.Entries, backup)
+						if err != nil {
+							return err
+						}
+						if deleted > 0 {
+							logger.Info("deleted unknown local files", "count", deleted)
+						}
 					}
 				}
 
@@ -112,12 +130,26 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				return nil
 			}
 
+			if rt.IsDryRun() {
+				if deleteUnknown {
+					deleted, err := logDryRunDeleteUnknown(logger, snapshot.Entries, backup)
+					if err != nil {
+						return err
+					}
+					if deleted > 0 {
+						logger.Info("would delete unknown local files", "count", deleted)
+					}
+				}
+				logLocalMatchSummary(logger, alreadyUpToDate, metadataUpdated)
+				return nil
+			}
+
 			files, refreshed, err := remotelist.ReadFiles(cmd.Context(), logger, userState.Token, vaultState, pathsToFetch, &snapshot, true)
 			if err != nil {
 				return err
 			}
 
-			if err := maybeSaveRemoteCache(cacheStore, &snapshot, refreshed, *noCache); err != nil {
+			if err := maybeSaveRemoteCache(cacheStore, &snapshot, refreshed, effectiveNoCache(*noCache, rt.IsDryRun())); err != nil {
 				return err
 			}
 

@@ -60,6 +60,10 @@ func newVaultSetupCommand(rt Runtime, apiBase *string, debug *bool) *cobra.Comma
 		Short: "Validate a vault password and write .ob1/vault.json",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := rt.requireWritable("vault setup"); err != nil {
+				return err
+			}
+
 			logger := rt.NewLogger(*debug)
 
 			if err := ensureCurrentDirectoryEmpty(); err != nil {

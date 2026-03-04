@@ -18,6 +18,10 @@ func NewPutCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 		Short: "Upload local files into the vault",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := rt.requireWritable("put"); err != nil {
+				return err
+			}
+
 			logger := rt.NewLogger(*debug)
 
 			userState, err := rt.Store.Load()

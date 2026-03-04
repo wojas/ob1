@@ -64,7 +64,7 @@ func NewListCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				return err
 			}
 
-			if err := maybeSaveRemoteCache(cacheStore, cached, snapshot, *noCache); err != nil {
+			if err := maybeSaveRemoteCache(cacheStore, cached, snapshot, effectiveNoCache(*noCache, rt.IsDryRun())); err != nil {
 				return err
 			}
 
