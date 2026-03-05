@@ -1,10 +1,15 @@
 package commands
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -50,7 +55,11 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				return err
 			}
 
+			stopSyncProgress := startPullProgressTicker(cmd.Context(), logger, func() []any {
+				return []any{"stage", "sync-snapshot"}
+			})
 			snapshot, err := remotelist.SyncEntries(cmd.Context(), logger, userState.Token, vaultState, cached, !*noCache)
+			stopSyncProgress()
 			if err != nil {
 				return err
 			}
@@ -63,70 +72,81 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 			alreadyUpToDate := 0
 			metadataUpdated := 0
 			basesCopied := 0
+			scannedEntries := 0
+			nextPlanProgress := time.Now().Add(5 * time.Second)
 			for _, entry := range snapshot.Entries {
-				if entry.Folder {
-					continue
-				}
-				if onlyNotes && !strings.EqualFold(filepath.Ext(entry.Path), ".md") {
-					continue
-				}
-
-				targetPath, ok := safeLocalTarget(entry.Path)
-				if !ok {
-					logger.Warn("skipping dangerous path", "path", entry.Path)
-					continue
-				}
-
-				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry, !rt.IsDryRun(), rt.IsVerify())
-				if err != nil {
-					return err
-				}
-				if upToDate {
-					if merge && !rt.IsDryRun() && entry.Hash != "" {
-						baseCopied, err := ensureMergeBaseFromLocal(targetPath, entry.Hash)
+				scannedEntries++
+				if !entry.Folder && (!onlyNotes || strings.EqualFold(filepath.Ext(entry.Path), ".md")) {
+					targetPath, ok := safeLocalTarget(entry.Path)
+					if !ok {
+						logger.Warn("skipping dangerous path", "path", entry.Path)
+					} else {
+						upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry, !rt.IsDryRun(), rt.IsVerify())
 						if err != nil {
 							return err
 						}
-						if baseCopied {
-							basesCopied++
-						}
-					}
-					if metadataOnly {
-						metadataUpdated++
-						if rt.IsDryRun() {
-							logger.Debug("file metadata would be updated", "path", targetPath)
+						if upToDate {
+							if merge && !rt.IsDryRun() && entry.Hash != "" {
+								baseCopied, err := ensureMergeBaseFromLocal(targetPath, entry.Hash)
+								if err != nil {
+									return err
+								}
+								if baseCopied {
+									basesCopied++
+								}
+							}
+							if metadataOnly {
+								metadataUpdated++
+								if rt.IsDryRun() {
+									logger.Debug("file metadata would be updated", "path", targetPath)
+								} else {
+									logger.Debug("updated file metadata", "path", targetPath)
+								}
+							} else {
+								alreadyUpToDate++
+								logger.Debug("file already up to date", "path", targetPath)
+							}
 						} else {
-							logger.Debug("updated file metadata", "path", targetPath)
+							keepLocal := false
+							if merge && entry.Hash != "" {
+								baseBody, hasBase, err := readMergeBase(targetPath)
+								if err != nil {
+									return err
+								}
+								if hasBase && vaultcrypto.PlaintextHash(baseBody) == entry.Hash {
+									logger.Info("keeping local changes", "path", targetPath)
+									keepLocal = true
+								}
+							}
+
+							if !keepLocal {
+								if rt.IsDryRun() {
+									if err := logDryRunPullAction(logger, targetPath, entry, backup); err != nil {
+										return err
+									}
+								} else if !merge {
+									if err := warnIfOverwritingLocalChanges(logger, targetPath, entry, backup); err != nil {
+										return err
+									}
+								}
+
+								pathsToFetch = append(pathsToFetch, targetPath)
+							}
 						}
-					} else {
-						alreadyUpToDate++
-						logger.Debug("file already up to date", "path", targetPath)
 					}
+				}
+
+				if time.Now().Before(nextPlanProgress) {
 					continue
 				}
-
-				if merge && entry.Hash != "" {
-					baseBody, hasBase, err := readMergeBase(targetPath)
-					if err != nil {
-						return err
-					}
-					if hasBase && vaultcrypto.PlaintextHash(baseBody) == entry.Hash {
-						logger.Info("keeping local changes", "path", targetPath)
-						continue
-					}
-				}
-
-				if rt.IsDryRun() {
-					if err := logDryRunPullAction(logger, targetPath, entry, backup); err != nil {
-						return err
-					}
-				} else if !merge {
-					if err := warnIfOverwritingLocalChanges(logger, targetPath, entry, backup); err != nil {
-						return err
-					}
-				}
-
-				pathsToFetch = append(pathsToFetch, targetPath)
+				logger.Info(
+					"pull in progress",
+					"stage", "plan",
+					"scanned_entries", scannedEntries,
+					"total_entries", len(snapshot.Entries),
+					"to_fetch", len(pathsToFetch),
+				)
+				nextPlanProgress = time.Now().Add(5 * time.Second)
 			}
 
 			if len(pathsToFetch) == 0 {
@@ -169,7 +189,27 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 				return nil
 			}
 
-			files, refreshed, err := remotelist.ReadFiles(cmd.Context(), logger, userState.Token, vaultState, pathsToFetch, &snapshot, true)
+			var pulledFiles atomic.Int64
+			stopDownloadProgress := startPullProgressTicker(cmd.Context(), logger, func() []any {
+				return []any{
+					"stage", "download",
+					"pulled_files", pulledFiles.Load(),
+					"total_files", len(pathsToFetch),
+				}
+			})
+			files, refreshed, err := remotelist.ReadFilesWithProgress(
+				cmd.Context(),
+				logger,
+				userState.Token,
+				vaultState,
+				pathsToFetch,
+				&snapshot,
+				true,
+				func(_ string, pulled int, _ int) {
+					pulledFiles.Store(int64(pulled))
+				},
+			)
+			stopDownloadProgress()
 			if err != nil {
 				return err
 			}
@@ -233,4 +273,31 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 	cmd.Flags().BoolVar(&onlyNotes, "only-notes", false, "only fetch markdown notes (*.md)")
 
 	return cmd
+}
+
+func startPullProgressTicker(ctx context.Context, logger *slog.Logger, attrs func() []any) func() {
+	done := make(chan struct{})
+	var once sync.Once
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				logger.Info("pull in progress", attrs()...)
+			}
+		}
+	}()
+
+	return func() {
+		once.Do(func() {
+			close(done)
+		})
+	}
 }

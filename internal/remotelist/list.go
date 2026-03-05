@@ -152,6 +152,10 @@ func ReadFile(ctx context.Context, logger *slog.Logger, token string, state vaul
 }
 
 func ReadFiles(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, targetPaths []string, cached *CacheState, useCache bool) ([]File, CacheState, error) {
+	return ReadFilesWithProgress(ctx, logger, token, state, targetPaths, cached, useCache, nil)
+}
+
+func ReadFilesWithProgress(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, targetPaths []string, cached *CacheState, useCache bool, onPulled func(path string, pulled int, total int)) ([]File, CacheState, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, CacheState{}, errors.New("missing auth token")
 	}
@@ -200,6 +204,9 @@ func ReadFiles(ctx context.Context, logger *slog.Logger, token string, state vau
 			Entry: entry,
 			Body:  body,
 		})
+		if onPulled != nil {
+			onPulled(targetPath, len(files), len(targetPaths))
+		}
 	}
 
 	return files, CacheState{
