@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="doc/assets/ob1-256.png" alt="ob1 logo" width="220">
+  <img src="doc/assets/ob1-256.png" alt="ob1 logo" width="110" height="128">
 </p>
 
 # ob1
