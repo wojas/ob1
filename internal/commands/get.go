@@ -84,7 +84,7 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					return err
 				}
 				if upToDate {
-					if !rt.IsDryRun() && entry.Hash != "" {
+					if merge && !rt.IsDryRun() && entry.Hash != "" {
 						baseCopied, err := ensureMergeBaseFromLocal(targetPath, entry.Hash)
 						if err != nil {
 							return err
@@ -150,9 +150,6 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					status, baseCopied, err = writeMergedFile(logger, file.Entry.Path, file, nil)
 				} else {
 					status, err = writeLocalFile(file.Entry.Path, file)
-					if err == nil {
-						baseCopied, err = writeMergeBase(file.Entry.Path, file.Body)
-					}
 				}
 				if err != nil {
 					return err
