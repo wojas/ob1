@@ -279,6 +279,8 @@ func startPullProgressTicker(ctx context.Context, logger *slog.Logger, attrs fun
 	done := make(chan struct{})
 	var once sync.Once
 
+	logger.Info("pull in progress", attrs()...)
+
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
