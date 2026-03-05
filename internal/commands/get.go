@@ -79,7 +79,7 @@ func NewGetCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					return fmt.Errorf("%q is a folder", targetPath)
 				}
 
-				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry, !rt.IsDryRun())
+				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry, !rt.IsDryRun(), rt.IsVerify())
 				if err != nil {
 					return err
 				}

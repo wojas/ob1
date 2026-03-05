@@ -30,6 +30,7 @@ type Runtime struct {
 	Store     *userstore.Store
 	NewLogger func(debug bool) *slog.Logger
 	DryRun    *bool
+	Verify    *bool
 }
 
 type backupSession struct {
@@ -44,6 +45,10 @@ const (
 
 func (rt Runtime) IsDryRun() bool {
 	return rt.DryRun != nil && *rt.DryRun
+}
+
+func (rt Runtime) IsVerify() bool {
+	return rt.Verify != nil && *rt.Verify
 }
 
 func (rt Runtime) requireWritable(command string) error {
@@ -316,18 +321,47 @@ func safeLocalTarget(remotePath string) (string, bool) {
 	return cleaned, true
 }
 
-func localFileMatchesRemote(path string, entry remotelist.Entry, applyMetadata bool) (bool, bool, error) {
+func localFileMatchesRemote(path string, entry remotelist.Entry, applyMetadata bool, verify bool) (bool, bool, error) {
+	info, err := os.Stat(path)
+	switch {
+	case err == nil:
+	case errors.Is(err, os.ErrNotExist):
+		return false, false, nil
+	default:
+		return false, false, fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	remoteMTime := entry.MTime
+	remoteSize := entry.Size
+	if remoteMTime > 0 && !info.ModTime().Equal(time.UnixMilli(remoteMTime)) {
+		remoteMTime = -1
+	}
+	if remoteSize >= 0 && info.Size() != remoteSize {
+		remoteSize = -1
+	}
+	if remoteMTime > 0 && remoteSize >= 0 {
+		remoteHash := strings.TrimSpace(entry.Hash)
+		if !verify || remoteHash == "" {
+			return true, false, nil
+		}
+
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return false, false, fmt.Errorf("read %s: %w", path, err)
+		}
+		if vaultcrypto.PlaintextHash(body) == remoteHash {
+			return true, false, nil
+		}
+		return false, false, nil
+	}
+
 	remoteHash := strings.TrimSpace(entry.Hash)
 	if remoteHash == "" {
 		return false, false, nil
 	}
 
 	body, err := os.ReadFile(path)
-	switch {
-	case err == nil:
-	case errors.Is(err, os.ErrNotExist):
-		return false, false, nil
-	default:
+	if err != nil {
 		return false, false, fmt.Errorf("read %s: %w", path, err)
 	}
 
@@ -337,11 +371,6 @@ func localFileMatchesRemote(path string, entry remotelist.Entry, applyMetadata b
 
 	if entry.MTime <= 0 {
 		return true, false, nil
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return false, false, fmt.Errorf("stat %s: %w", path, err)
 	}
 
 	mtime := time.UnixMilli(entry.MTime)

@@ -77,7 +77,7 @@ func NewPullCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 					continue
 				}
 
-				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry, !rt.IsDryRun())
+				upToDate, metadataOnly, err := localFileMatchesRemote(targetPath, entry, !rt.IsDryRun(), rt.IsVerify())
 				if err != nil {
 					return err
 				}

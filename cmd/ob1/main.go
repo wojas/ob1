@@ -30,6 +30,7 @@ func run() int {
 	var debug bool
 	var dryRun bool
 	var noCache bool
+	var verify bool
 	var apiBase string
 
 	root := &cobra.Command{
@@ -42,12 +43,14 @@ func run() int {
 	root.PersistentFlags().BoolVar(&debug, "debug", false, "enable debug logging")
 	root.PersistentFlags().BoolVarP(&dryRun, "dry-run", "n", false, "show what would change without making local changes")
 	root.PersistentFlags().BoolVar(&noCache, "no-cache", false, "skip reading and writing the local remote snapshot cache")
+	root.PersistentFlags().BoolVar(&verify, "verify", false, "verify unchanged files by hashing when size and mtime match")
 	root.PersistentFlags().StringVar(&apiBase, "api-base", defaultAPIBase(), "Obsidian API base URL")
 
 	runtime := commands.Runtime{
 		Store:     store,
 		NewLogger: newLogger,
 		DryRun:    &dryRun,
+		Verify:    &verify,
 	}
 
 	root.AddCommand(commands.NewLoginCommand(runtime, &apiBase, &debug))
