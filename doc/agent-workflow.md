@@ -68,3 +68,11 @@ When editing a single note such as `path/to/note.md`, use this sequence:
 - `ob1 put` accepts file paths only. Do not pass directories such as `notes/` or `.`; expand to explicit files first.
 - Only run `put` for files the agent intentionally changed.
 - If `ob1 get --merge` produces conflicts, treat that as a required resolution step, not as a successful sync.
+- Do not use `ob1 experimental mv` on production data. It is experimental and has known sync bugs.
+- For rename/move workflows, use manual copy + upload + remove:
+
+```sh
+cp old/path.md new/path.md
+ob1 put new/path.md
+ob1 rm old/path.md
+```

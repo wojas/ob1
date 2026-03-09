@@ -386,7 +386,7 @@ func TestMVMovesRemoteAndLocalWithBackup(t *testing.T) {
 		t.Fatalf("write local target candidate: %v", err)
 	}
 
-	cli.run("experimental-mv", "move.txt", "archive/move-renamed.txt").requireSuccess(t)
+	cli.run("experimental", "mv", "move.txt", "archive/move-renamed.txt").requireSuccess(t)
 
 	if _, ok := server.FileBody("move.txt"); ok {
 		t.Fatal("remote source still exists after mv")
@@ -470,7 +470,7 @@ func TestMVDryRunDoesNotModifyState(t *testing.T) {
 		t.Fatalf("read cache before mv dry-run: %v", err)
 	}
 
-	cli.run("--dry-run", "experimental-mv", "dry-mv.txt", "archive/dry-mv-renamed.txt").requireSuccess(t)
+	cli.run("--dry-run", "experimental", "mv", "dry-mv.txt", "archive/dry-mv-renamed.txt").requireSuccess(t)
 
 	remoteSourceBody, ok := server.FileBody("dry-mv.txt")
 	if !ok {
@@ -537,7 +537,7 @@ func TestMVRejectsDirectoryLikeDestination(t *testing.T) {
 		t.Fatalf("write local source: %v", err)
 	}
 
-	result := cli.run("experimental-mv", "source.txt", "archive/")
+	result := cli.run("experimental", "mv", "source.txt", "archive/")
 	result.requireFailure(t)
 	if !strings.Contains(result.stderr, "destination must include a file name") {
 		t.Fatalf("expected directory-like destination validation error, stderr:\n%s", result.stderr)
@@ -576,7 +576,7 @@ func TestMVRejectsExistingDirectoryDestination(t *testing.T) {
 	loginAndSetup(t, cli, server)
 	cli.run("get", "--merge", "source.txt").requireSuccess(t)
 
-	result := cli.run("experimental-mv", "source.txt", "archive")
+	result := cli.run("experimental", "mv", "source.txt", "archive")
 	result.requireFailure(t)
 	if !strings.Contains(result.stderr, "exists as a folder") {
 		t.Fatalf("expected folder destination error, stderr:\n%s", result.stderr)
@@ -593,16 +593,34 @@ func TestMVRejectsExistingDirectoryDestination(t *testing.T) {
 func TestMVHelpDocumentsSpecialCases(t *testing.T) {
 	cli := newCLIHarness(t, "http://127.0.0.1:1")
 
-	result := cli.run("experimental-mv", "--help")
+	result := cli.run("experimental", "mv", "--help")
 	result.requireSuccess(t)
 
 	for _, needle := range []string{
+		"EXPERIMENTAL: known sync bugs may duplicate or resurrect files",
 		"destination must be a file path",
 		`"archive/" is rejected`,
-		`ob1 experimental-mv note.md archive/note.md`,
+		`ob1 experimental mv note.md archive/note.md`,
 	} {
 		if !strings.Contains(result.stdout, needle) {
 			t.Fatalf("mv help missing %q:\n%s", needle, result.stdout)
+		}
+	}
+}
+
+func TestExperimentalHelpWarnsAgainstProductionUse(t *testing.T) {
+	cli := newCLIHarness(t, "http://127.0.0.1:1")
+
+	result := cli.run("experimental", "--help")
+	result.requireSuccess(t)
+
+	for _, needle := range []string{
+		"Do not use these commands on production data",
+		`"ob1 put <new-path>"`,
+		`"ob1 rm <old-path>"`,
+	} {
+		if !strings.Contains(result.stdout, needle) {
+			t.Fatalf("experimental help missing %q:\n%s", needle, result.stdout)
 		}
 	}
 }

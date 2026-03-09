@@ -18,9 +18,17 @@ func NewMoveCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 	var noBackup bool
 
 	cmd := &cobra.Command{
-		Use:   "experimental-mv <source> <destination>",
+		Use:   "mv <source> <destination>",
 		Short: "Move or rename a remote file and its local copy",
 		Long: strings.TrimSpace(`
+EXPERIMENTAL: known sync bugs may duplicate or resurrect files.
+Do not use this command on production data.
+
+For agent workflows, prefer:
+1. copy the file locally to the new path,
+2. "ob1 put" the new path,
+3. "ob1 rm" the old path.
+
 Move or rename a file in the remote vault and then move the local file.
 
 The destination must be a file path (include a filename). Passing a directory
@@ -28,11 +36,11 @@ path such as "archive/" is rejected. To move into another directory, provide
 the full destination path, for example "archive/note.md".
 
 Folder moves are not supported.
-`),
+		`),
 		Example: strings.TrimSpace(`
-  ob1 experimental-mv note.md archive/note.md
-  ob1 experimental-mv notes/todo.md done/todo-2026-03-09.md
-  ob1 --dry-run experimental-mv note.md archive/note.md
+  ob1 experimental mv note.md archive/note.md
+  ob1 experimental mv notes/todo.md done/todo-2026-03-09.md
+  ob1 --dry-run experimental mv note.md archive/note.md
 `),
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {

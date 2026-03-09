@@ -37,7 +37,7 @@ ob1 pull --delete-unknown     # mirror remote deletions for non-hidden files
 
 # Upload
 ob1 put path/to/note.md       # upload specific files
-ob1 experimental-mv note.md archive/note.md # rename/move remote + local file
+ob1 experimental mv note.md archive/note.md # experimental rename/move (see warning below)
 ob1 rm path/to/note.md        # remove remote + local copy (local backup by default)
 ```
 
@@ -58,10 +58,22 @@ Running `ob1 vault setup` in a directory creates a `.ob1/` folder that ties that
 | `get <file> [...]` | Download specific files. Skips files that are already up to date locally. Use `--merge` to merge text changes instead of overwriting. |
 | `pull` | Download all remote files. Use `--only-notes` to limit to `.md` files, `--merge` to merge text changes, and `--delete-unknown` to remove non-hidden local files that no longer exist remotely. Existing files are backed up before overwrite or deletion unless `--no-backup` is set. |
 | `put <file> [...]` | Upload local files to the vault. Skips unchanged files. |
-| `experimental-mv <source> <destination>` | Move or rename a remote file and its local copy. Destination must include a filename (directory paths like `archive/` are rejected). If the local destination exists, it is backed up by default; pass `--no-backup` to disable backups. Folders are not supported yet. |
+| `experimental` | Experimental commands with known sync bugs. Do not use on production data. |
+| `experimental mv <source> <destination>` | Move or rename a remote file and its local copy. Destination must include a filename (directory paths like `archive/` are rejected). If the local destination exists, it is backed up by default; pass `--no-backup` to disable backups. Folders are not supported yet. |
 | `rm <file> [...]` | Remove remote files from the vault and remove local copies. Local files are backed up by default; pass `--no-backup` to disable backups. Folders are not supported yet. |
 
 All commands support `--debug` for request and protocol logging, `--no-cache` to bypass the local snapshot cache, and `--dry-run` to show what would change without making local changes. `status` also supports `-v` for human-readable explanations.
+
+## Experimental Commands
+
+- `ob1 experimental ...` commands have known sync bugs and are not safe for production data.
+- For agent workflows, prefer manual rename semantics:
+
+```sh
+cp old/path.md new/path.md
+ob1 put new/path.md
+ob1 rm old/path.md
+```
 
 ## Local state
 
