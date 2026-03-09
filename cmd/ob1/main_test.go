@@ -73,7 +73,7 @@ func TestCLIWorkflowAgainstTestServer(t *testing.T) {
 		t.Fatalf("unexpected cat output: %q", cat.stdout)
 	}
 
-	cli.run("get", "notes/todo.md").requireSuccess(t)
+	cli.run("get", "--merge", "notes/todo.md").requireSuccess(t)
 
 	noteBody, err := os.ReadFile(filepath.Join(cli.workDir, "notes", "todo.md"))
 	if err != nil {
@@ -212,7 +212,7 @@ func TestGetMergePerformsCleanThreeWayMerge(t *testing.T) {
 
 	cli := newCLIHarness(t, server.APIBaseURL())
 	loginAndSetup(t, cli, server)
-	cli.run("get", "merge.txt").requireSuccess(t)
+	cli.run("get", "--merge", "merge.txt").requireSuccess(t)
 
 	if err := os.WriteFile(filepath.Join(cli.workDir, "merge.txt"), []byte("alpha local\nshared\nomega\n"), 0o644); err != nil {
 		t.Fatalf("write local merge candidate: %v", err)
@@ -258,7 +258,7 @@ func TestPullMergeWritesConflictMarkersAndBackup(t *testing.T) {
 
 	cli := newCLIHarness(t, server.APIBaseURL())
 	loginAndSetup(t, cli, server)
-	cli.run("get", "conflict.txt").requireSuccess(t)
+	cli.run("get", "--merge", "conflict.txt").requireSuccess(t)
 
 	if err := os.WriteFile(filepath.Join(cli.workDir, "conflict.txt"), []byte("one\nlocal change\nthree\n"), 0o644); err != nil {
 		t.Fatalf("write local conflict file: %v", err)
@@ -326,7 +326,7 @@ func TestPullMergeKeepsLocalChangesWhenRemoteMatchesMergeBase(t *testing.T) {
 
 	cli := newCLIHarness(t, server.APIBaseURL())
 	loginAndSetup(t, cli, server)
-	cli.run("get", "keep.txt").requireSuccess(t)
+	cli.run("get", "--merge", "keep.txt").requireSuccess(t)
 
 	if err := os.WriteFile(filepath.Join(cli.workDir, "keep.txt"), []byte("local only change\n"), 0o644); err != nil {
 		t.Fatalf("write local keep file: %v", err)
@@ -356,6 +356,116 @@ func TestPullMergeKeepsLocalChangesWhenRemoteMatchesMergeBase(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cli.workDir, ".ob1", "backup")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("backup directory should not be created when keeping local changes, err=%v", err)
+	}
+}
+
+func TestRMRemovesRemoteAndLocalWithBackup(t *testing.T) {
+	server, err := testserver.New(testserver.Options{
+		InitialFiles: map[string][]byte{
+			"remove.txt": []byte("remote original\n"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("start test server: %v", err)
+	}
+	t.Cleanup(server.Close)
+
+	cli := newCLIHarness(t, server.APIBaseURL())
+	loginAndSetup(t, cli, server)
+	cli.run("get", "--merge", "remove.txt").requireSuccess(t)
+
+	localPath := filepath.Join(cli.workDir, "remove.txt")
+	if err := os.WriteFile(localPath, []byte("local changed\n"), 0o644); err != nil {
+		t.Fatalf("write local remove candidate: %v", err)
+	}
+
+	cli.run("rm", "remove.txt").requireSuccess(t)
+
+	if _, ok := server.FileBody("remove.txt"); ok {
+		t.Fatal("remote file still exists after rm")
+	}
+	if _, err := os.Stat(localPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("local file was not removed, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cli.workDir, ".ob1", "base", "remove.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge base was not removed, err=%v", err)
+	}
+
+	backupMatches, err := filepath.Glob(filepath.Join(cli.workDir, ".ob1", "backup", "*", "remove.txt"))
+	if err != nil {
+		t.Fatalf("glob rm backups: %v", err)
+	}
+	if len(backupMatches) != 1 {
+		t.Fatalf("expected one backup for remove.txt, found %d", len(backupMatches))
+	}
+
+	backupBody, err := os.ReadFile(backupMatches[0])
+	if err != nil {
+		t.Fatalf("read rm backup: %v", err)
+	}
+	if string(backupBody) != "local changed\n" {
+		t.Fatalf("unexpected rm backup content: %q", string(backupBody))
+	}
+}
+
+func TestRMDryRunDoesNotModifyState(t *testing.T) {
+	server, err := testserver.New(testserver.Options{
+		InitialFiles: map[string][]byte{
+			"dry-rm.txt": []byte("remote original\n"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("start test server: %v", err)
+	}
+	t.Cleanup(server.Close)
+
+	cli := newCLIHarness(t, server.APIBaseURL())
+	loginAndSetup(t, cli, server)
+	cli.run("get", "--merge", "dry-rm.txt").requireSuccess(t)
+
+	localPath := filepath.Join(cli.workDir, "dry-rm.txt")
+	if err := os.WriteFile(localPath, []byte("local changed\n"), 0o644); err != nil {
+		t.Fatalf("write local dry-run candidate: %v", err)
+	}
+
+	cachePath := filepath.Join(cli.workDir, ".ob1", "cache.json")
+	cacheBefore, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache before rm dry-run: %v", err)
+	}
+
+	result := cli.run("--dry-run", "rm", "dry-rm.txt")
+	result.requireSuccess(t)
+
+	remoteBody, ok := server.FileBody("dry-rm.txt")
+	if !ok {
+		t.Fatal("remote file was deleted during rm --dry-run")
+	}
+	if string(remoteBody) != "remote original\n" {
+		t.Fatalf("unexpected remote body after rm --dry-run: %q", string(remoteBody))
+	}
+
+	localBody, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("read local file after rm dry-run: %v", err)
+	}
+	if string(localBody) != "local changed\n" {
+		t.Fatalf("local file was modified during rm --dry-run: %q", string(localBody))
+	}
+
+	if _, err := os.Stat(filepath.Join(cli.workDir, ".ob1", "base", "dry-rm.txt")); err != nil {
+		t.Fatalf("merge base should remain after rm --dry-run, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cli.workDir, ".ob1", "backup")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup directory should not be created during rm --dry-run, err=%v", err)
+	}
+
+	cacheAfter, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache after rm dry-run: %v", err)
+	}
+	if string(cacheAfter) != string(cacheBefore) {
+		t.Fatal("cache changed during rm --dry-run")
 	}
 }
 

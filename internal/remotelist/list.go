@@ -586,6 +586,89 @@ func PutFiles(ctx context.Context, logger *slog.Logger, token string, state vaul
 	}, nil
 }
 
+func RemoveFiles(ctx context.Context, logger *slog.Logger, token string, state vaultstore.VaultState, paths []string, baseline CacheState) (CacheState, error) {
+	if strings.TrimSpace(token) == "" {
+		return CacheState{}, errors.New("missing auth token")
+	}
+
+	entriesByPath := make(map[string]Entry, len(baseline.Entries))
+	for _, entry := range baseline.Entries {
+		entriesByPath[entry.Path] = entry
+	}
+
+	for _, targetPath := range paths {
+		entry, exists := entriesByPath[targetPath]
+		if !exists {
+			return CacheState{}, fmt.Errorf("remote file %q not found", targetPath)
+		}
+		if entry.Folder {
+			return CacheState{}, fmt.Errorf("%q is a folder", targetPath)
+		}
+	}
+
+	startVersion := baseline.Version
+	initial := startVersion == 0
+
+	rawKey, conn, err := dialAndInit(ctx, logger, token, state, startVersion, initial)
+	if err != nil {
+		return CacheState{}, err
+	}
+	defer conn.Close()
+
+	for _, targetPath := range paths {
+		entry := entriesByPath[targetPath]
+
+		encodedPath, err := vaultcrypto.EncodeMetadata(rawKey, state.Salt, state.EncryptionVersion, targetPath)
+		if err != nil {
+			return CacheState{}, fmt.Errorf("encode file path %q: %w", targetPath, err)
+		}
+
+		extension := strings.TrimPrefix(path.Ext(targetPath), ".")
+		if err := sendPush(logger, conn, pushRequest{
+			Op:        "push",
+			Path:      encodedPath,
+			Extension: extension,
+			Hash:      "",
+			CTime:     entry.CTime,
+			MTime:     entry.MTime,
+			Folder:    false,
+			Deleted:   true,
+		}, nil); err != nil {
+			return CacheState{}, fmt.Errorf("remove %q: %w", targetPath, err)
+		}
+
+		delete(entriesByPath, targetPath)
+		logger.Info("removed remote file", "path", targetPath)
+	}
+
+	updatedEntries := make([]Entry, 0, len(entriesByPath))
+	for _, entry := range entriesByPath {
+		updatedEntries = append(updatedEntries, entry)
+	}
+	sort.Slice(updatedEntries, func(i, j int) bool {
+		if updatedEntries[i].Path == updatedEntries[j].Path {
+			return updatedEntries[i].UID < updatedEntries[j].UID
+		}
+		return updatedEntries[i].Path < updatedEntries[j].Path
+	})
+
+	extra := map[string]json.RawMessage(nil)
+	if len(baseline.Extra) != 0 {
+		extra = make(map[string]json.RawMessage, len(baseline.Extra))
+		for key, value := range baseline.Extra {
+			extra[key] = value
+		}
+	}
+
+	return CacheState{
+		SchemaVersion: baseline.SchemaVersion,
+		Version:       startVersion,
+		Entries:       updatedEntries,
+		SavedAt:       time.Now().UTC(),
+		Extra:         extra,
+	}, nil
+}
+
 func ensureRemoteDirectories(logger *slog.Logger, conn *websocket.Conn, rawKey []byte, state vaultstore.VaultState, entriesByPath map[string]Entry, uploads []Upload) error {
 	required := make(map[string]struct{})
 	for _, upload := range uploads {

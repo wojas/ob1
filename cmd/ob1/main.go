@@ -64,6 +64,7 @@ func runWithArgs(args []string) int {
 	root.AddCommand(commands.NewListCommand(runtime, &debug, &noCache))
 	root.AddCommand(commands.NewPullCommand(runtime, &debug, &noCache))
 	root.AddCommand(commands.NewPutCommand(runtime, &debug, &noCache))
+	root.AddCommand(commands.NewRemoveCommand(runtime, &debug, &noCache))
 	root.AddCommand(commands.NewStatusCommand(runtime, &debug, &noCache))
 	root.AddCommand(commands.NewLogoutCommand(runtime, &apiBase, &debug))
 	root.AddCommand(commands.NewVaultCommand(runtime, &apiBase, &debug))
