@@ -46,6 +46,10 @@ func NewPutCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 			for _, arg := range args {
 				remotePath, ok := safeLocalTarget(arg)
 				if !ok {
+					info, err := os.Stat(arg)
+					if err == nil && info.IsDir() {
+						return fmt.Errorf("%s is a directory", arg)
+					}
 					logger.Warn("skipping dangerous path", "path", arg)
 					continue
 				}
