@@ -2,3 +2,4 @@
 *~
 *.bak
 .*.sw?
+.DS_Store
