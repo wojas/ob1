@@ -21,6 +21,10 @@ func main() {
 }
 
 func run() int {
+	return runWithArgs(os.Args[1:])
+}
+
+func runWithArgs(args []string) int {
 	store, err := userstore.NewDefault()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -63,6 +67,7 @@ func run() int {
 	root.AddCommand(commands.NewStatusCommand(runtime, &debug, &noCache))
 	root.AddCommand(commands.NewLogoutCommand(runtime, &apiBase, &debug))
 	root.AddCommand(commands.NewVaultCommand(runtime, &apiBase, &debug))
+	root.SetArgs(args)
 
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		newLogger(debug).Error(err.Error())
