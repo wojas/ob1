@@ -359,6 +359,254 @@ func TestPullMergeKeepsLocalChangesWhenRemoteMatchesMergeBase(t *testing.T) {
 	}
 }
 
+func TestMVMovesRemoteAndLocalWithBackup(t *testing.T) {
+	server, err := testserver.New(testserver.Options{
+		InitialFiles: map[string][]byte{
+			"move.txt": []byte("remote original\n"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("start test server: %v", err)
+	}
+	t.Cleanup(server.Close)
+
+	cli := newCLIHarness(t, server.APIBaseURL())
+	loginAndSetup(t, cli, server)
+	cli.run("get", "--merge", "move.txt").requireSuccess(t)
+
+	sourcePath := filepath.Join(cli.workDir, "move.txt")
+	targetPath := filepath.Join(cli.workDir, "archive", "move-renamed.txt")
+	if err := os.WriteFile(sourcePath, []byte("local changed\n"), 0o644); err != nil {
+		t.Fatalf("write local source candidate: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		t.Fatalf("create local target parent: %v", err)
+	}
+	if err := os.WriteFile(targetPath, []byte("local target old\n"), 0o644); err != nil {
+		t.Fatalf("write local target candidate: %v", err)
+	}
+
+	cli.run("experimental-mv", "move.txt", "archive/move-renamed.txt").requireSuccess(t)
+
+	if _, ok := server.FileBody("move.txt"); ok {
+		t.Fatal("remote source still exists after mv")
+	}
+	remoteBody, ok := server.FileBody("archive/move-renamed.txt")
+	if !ok {
+		t.Fatal("remote target missing after mv")
+	}
+	if string(remoteBody) != "remote original\n" {
+		t.Fatalf("unexpected remote moved body: %q", string(remoteBody))
+	}
+
+	if _, err := os.Stat(sourcePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("local source was not moved, err=%v", err)
+	}
+	localMovedBody, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("read local moved target: %v", err)
+	}
+	if string(localMovedBody) != "local changed\n" {
+		t.Fatalf("unexpected local moved body: %q", string(localMovedBody))
+	}
+
+	backupMatches, err := filepath.Glob(filepath.Join(cli.workDir, ".ob1", "backup", "*", "archive", "move-renamed.txt"))
+	if err != nil {
+		t.Fatalf("glob mv backups: %v", err)
+	}
+	if len(backupMatches) != 1 {
+		t.Fatalf("expected one backup for archive/move-renamed.txt, found %d", len(backupMatches))
+	}
+	backupBody, err := os.ReadFile(backupMatches[0])
+	if err != nil {
+		t.Fatalf("read mv backup: %v", err)
+	}
+	if string(backupBody) != "local target old\n" {
+		t.Fatalf("unexpected mv backup content: %q", string(backupBody))
+	}
+
+	if _, err := os.Stat(filepath.Join(cli.workDir, ".ob1", "base", "move.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source merge base still exists after mv, err=%v", err)
+	}
+	baseBody, err := os.ReadFile(filepath.Join(cli.workDir, ".ob1", "base", "archive", "move-renamed.txt"))
+	if err != nil {
+		t.Fatalf("read target merge base: %v", err)
+	}
+	if string(baseBody) != "remote original\n" {
+		t.Fatalf("unexpected target merge base content: %q", string(baseBody))
+	}
+}
+
+func TestMVDryRunDoesNotModifyState(t *testing.T) {
+	server, err := testserver.New(testserver.Options{
+		InitialFiles: map[string][]byte{
+			"dry-mv.txt": []byte("remote original\n"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("start test server: %v", err)
+	}
+	t.Cleanup(server.Close)
+
+	cli := newCLIHarness(t, server.APIBaseURL())
+	loginAndSetup(t, cli, server)
+	cli.run("get", "--merge", "dry-mv.txt").requireSuccess(t)
+
+	sourcePath := filepath.Join(cli.workDir, "dry-mv.txt")
+	targetPath := filepath.Join(cli.workDir, "archive", "dry-mv-renamed.txt")
+	if err := os.WriteFile(sourcePath, []byte("local changed\n"), 0o644); err != nil {
+		t.Fatalf("write local dry-run source candidate: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		t.Fatalf("create dry-run target parent: %v", err)
+	}
+	if err := os.WriteFile(targetPath, []byte("local target old\n"), 0o644); err != nil {
+		t.Fatalf("write dry-run target candidate: %v", err)
+	}
+
+	cachePath := filepath.Join(cli.workDir, ".ob1", "cache.json")
+	cacheBefore, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache before mv dry-run: %v", err)
+	}
+
+	cli.run("--dry-run", "experimental-mv", "dry-mv.txt", "archive/dry-mv-renamed.txt").requireSuccess(t)
+
+	remoteSourceBody, ok := server.FileBody("dry-mv.txt")
+	if !ok {
+		t.Fatal("remote source was moved during mv --dry-run")
+	}
+	if string(remoteSourceBody) != "remote original\n" {
+		t.Fatalf("unexpected remote source body after dry-run: %q", string(remoteSourceBody))
+	}
+	if _, ok := server.FileBody("archive/dry-mv-renamed.txt"); ok {
+		t.Fatal("remote target was created during mv --dry-run")
+	}
+
+	localSourceBody, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("read local source after mv dry-run: %v", err)
+	}
+	if string(localSourceBody) != "local changed\n" {
+		t.Fatalf("local source changed during mv --dry-run: %q", string(localSourceBody))
+	}
+	localTargetBody, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("read local target after mv dry-run: %v", err)
+	}
+	if string(localTargetBody) != "local target old\n" {
+		t.Fatalf("local target changed during mv --dry-run: %q", string(localTargetBody))
+	}
+
+	if _, err := os.Stat(filepath.Join(cli.workDir, ".ob1", "base", "dry-mv.txt")); err != nil {
+		t.Fatalf("source merge base should remain after mv --dry-run, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cli.workDir, ".ob1", "base", "archive", "dry-mv-renamed.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target merge base should not be created during mv --dry-run, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cli.workDir, ".ob1", "backup")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup directory should not be created during mv --dry-run, err=%v", err)
+	}
+
+	cacheAfter, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache after mv dry-run: %v", err)
+	}
+	if string(cacheAfter) != string(cacheBefore) {
+		t.Fatal("cache changed during mv --dry-run")
+	}
+}
+
+func TestMVRejectsDirectoryLikeDestination(t *testing.T) {
+	server, err := testserver.New(testserver.Options{
+		InitialFiles: map[string][]byte{
+			"source.txt": []byte("remote source\n"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("start test server: %v", err)
+	}
+	t.Cleanup(server.Close)
+
+	cli := newCLIHarness(t, server.APIBaseURL())
+	loginAndSetup(t, cli, server)
+	cli.run("get", "--merge", "source.txt").requireSuccess(t)
+
+	localSourcePath := filepath.Join(cli.workDir, "source.txt")
+	if err := os.WriteFile(localSourcePath, []byte("local source\n"), 0o644); err != nil {
+		t.Fatalf("write local source: %v", err)
+	}
+
+	result := cli.run("experimental-mv", "source.txt", "archive/")
+	result.requireFailure(t)
+	if !strings.Contains(result.stderr, "destination must include a file name") {
+		t.Fatalf("expected directory-like destination validation error, stderr:\n%s", result.stderr)
+	}
+
+	remoteBody, ok := server.FileBody("source.txt")
+	if !ok {
+		t.Fatal("remote source file was changed despite validation failure")
+	}
+	if string(remoteBody) != "remote source\n" {
+		t.Fatalf("unexpected remote source body after failed mv: %q", string(remoteBody))
+	}
+
+	localBody, err := os.ReadFile(localSourcePath)
+	if err != nil {
+		t.Fatalf("read local source after failed mv: %v", err)
+	}
+	if string(localBody) != "local source\n" {
+		t.Fatalf("local source changed after failed mv: %q", string(localBody))
+	}
+}
+
+func TestMVRejectsExistingDirectoryDestination(t *testing.T) {
+	server, err := testserver.New(testserver.Options{
+		InitialFiles: map[string][]byte{
+			"source.txt":          []byte("remote source\n"),
+			"archive/existing.md": []byte("remote sibling\n"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("start test server: %v", err)
+	}
+	t.Cleanup(server.Close)
+
+	cli := newCLIHarness(t, server.APIBaseURL())
+	loginAndSetup(t, cli, server)
+	cli.run("get", "--merge", "source.txt").requireSuccess(t)
+
+	result := cli.run("experimental-mv", "source.txt", "archive")
+	result.requireFailure(t)
+	if !strings.Contains(result.stderr, "exists as a folder") {
+		t.Fatalf("expected folder destination error, stderr:\n%s", result.stderr)
+	}
+
+	if _, ok := server.FileBody("archive/source.txt"); ok {
+		t.Fatal("remote file moved into directory despite rejected destination")
+	}
+	if _, ok := server.FileBody("source.txt"); !ok {
+		t.Fatal("remote source removed despite rejected destination")
+	}
+}
+
+func TestMVHelpDocumentsSpecialCases(t *testing.T) {
+	cli := newCLIHarness(t, "http://127.0.0.1:1")
+
+	result := cli.run("experimental-mv", "--help")
+	result.requireSuccess(t)
+
+	for _, needle := range []string{
+		"destination must be a file path",
+		`"archive/" is rejected`,
+		`ob1 experimental-mv note.md archive/note.md`,
+	} {
+		if !strings.Contains(result.stdout, needle) {
+			t.Fatalf("mv help missing %q:\n%s", needle, result.stdout)
+		}
+	}
+}
+
 func TestRMRemovesRemoteAndLocalWithBackup(t *testing.T) {
 	server, err := testserver.New(testserver.Options{
 		InitialFiles: map[string][]byte{
@@ -582,4 +830,14 @@ func (r cliResult) requireSuccess(t *testing.T) {
 	}
 
 	t.Fatalf("command failed with exit code %d\nstdout:\n%s\nstderr:\n%s", r.code, r.stdout, r.stderr)
+}
+
+func (r cliResult) requireFailure(t *testing.T) {
+	t.Helper()
+
+	if r.code != 0 {
+		return
+	}
+
+	t.Fatalf("command unexpectedly succeeded\nstdout:\n%s\nstderr:\n%s", r.stdout, r.stderr)
 }

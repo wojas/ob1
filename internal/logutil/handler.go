@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 const (
@@ -20,6 +19,7 @@ const (
 	colorYellow = "\x1b[33m"
 	colorBlue   = "\x1b[34m"
 	colorCyan   = "\x1b[36m"
+	timeFormat  = "2006-01-02T15:04:05.000000000-07:00"
 )
 
 type blockValue struct {
@@ -59,7 +59,7 @@ func (h *TextHandler) Handle(_ context.Context, record slog.Record) error {
 	blocks := make([]blockValue, 0, 4)
 
 	if !record.Time.IsZero() {
-		inline = append(inline, h.formatInline("time", record.Time.Format(time.RFC3339Nano), false))
+		inline = append(inline, h.formatInline("time", record.Time.Format(timeFormat), false))
 	}
 	inline = append(inline, h.formatLevel(record.Level))
 	inline = append(inline, h.formatInline("msg", record.Message, true))
@@ -212,7 +212,7 @@ func formatValue(value slog.Value) (string, bool) {
 	case slog.KindDuration:
 		return value.Duration().String(), false
 	case slog.KindTime:
-		return value.Time().Format(time.RFC3339Nano), false
+		return value.Time().Format(timeFormat), false
 	case slog.KindAny:
 		anyValue := value.Any()
 		if err, ok := anyValue.(error); ok {

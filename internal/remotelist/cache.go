@@ -169,6 +169,7 @@ func (e Entry) MarshalJSON() ([]byte, error) {
 		"path":   e.Path,
 		"uid":    e.UID,
 		"size":   e.Size,
+		"pieces": e.Pieces,
 		"ctime":  e.CTime,
 		"mtime":  e.MTime,
 		"hash":   e.Hash,
@@ -201,6 +202,9 @@ func (e *Entry) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	if err := unmarshalFirst(raw, &e.Size, "size", "Size"); err != nil {
+		return err
+	}
+	if err := unmarshalFirst(raw, &e.Pieces, "pieces", "Pieces"); err != nil {
 		return err
 	}
 	if err := unmarshalFirst(raw, &e.CTime, "ctime", "CTime"); err != nil {

@@ -90,16 +90,17 @@ type pullRequest struct {
 }
 
 type pushRequest struct {
-	Op        string `json:"op"`
-	Path      string `json:"path"`
-	Hash      string `json:"hash"`
-	CTime     int64  `json:"ctime"`
-	MTime     int64  `json:"mtime"`
-	Folder    bool   `json:"folder"`
-	Deleted   bool   `json:"deleted"`
-	Size      int64  `json:"size"`
-	Pieces    int    `json:"pieces"`
-	Extension string `json:"extension"`
+	Op          string  `json:"op"`
+	Path        string  `json:"path"`
+	RelatedPath *string `json:"relatedpath"`
+	Hash        string  `json:"hash"`
+	CTime       int64   `json:"ctime"`
+	MTime       int64   `json:"mtime"`
+	Folder      bool    `json:"folder"`
+	Deleted     bool    `json:"deleted"`
+	Size        int64   `json:"size"`
+	Pieces      int     `json:"pieces"`
+	Extension   string  `json:"extension"`
 }
 
 type pendingUpload struct {
@@ -553,6 +554,21 @@ func (s *Server) handlePushStart(conn *websocket.Conn, req pushRequest) (*pendin
 		return nil, writeWSJSON(conn, map[string]any{"res": "ok"})
 	}
 
+	if req.RelatedPath != nil && strings.TrimSpace(*req.RelatedPath) != "" {
+		decodedRelatedPath, err := vaultcrypto.DecodeMetadata(s.rawKey, s.vault.Salt, s.vault.EncryptionVersion, *req.RelatedPath)
+		if err != nil {
+			return nil, fmt.Errorf("decode related path: %w", err)
+		}
+		normalizedRelatedPath := normalizePath(decodedRelatedPath)
+		if normalizedRelatedPath == "" {
+			return nil, errors.New("invalid related path")
+		}
+		if err := s.copyFileFromRelatedPath(normalizedRelatedPath, normalized, req.CTime, req.MTime); err != nil {
+			return nil, err
+		}
+		return nil, writeWSJSON(conn, map[string]any{"res": "ok"})
+	}
+
 	decodedHash := ""
 	if strings.TrimSpace(req.Hash) != "" {
 		decodedHash, err = vaultcrypto.DecodeMetadata(s.rawKey, s.vault.Salt, s.vault.EncryptionVersion, req.Hash)
@@ -776,6 +792,50 @@ func (s *Server) deletePath(filePath string) {
 	delete(s.entriesBy, filePath)
 	delete(s.entriesByID, current.UID)
 	s.version++
+}
+
+func (s *Server) copyFileFromRelatedPath(sourcePath string, targetPath string, ctime int64, mtime int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	source, ok := s.entriesBy[sourcePath]
+	if !ok {
+		return fmt.Errorf("path %q not found", sourcePath)
+	}
+	if source.Folder {
+		return fmt.Errorf("path %q is a folder", sourcePath)
+	}
+	if existing, ok := s.entriesBy[targetPath]; ok {
+		if existing.Folder {
+			return fmt.Errorf("path %q is a folder", targetPath)
+		}
+		return fmt.Errorf("path %q already exists", targetPath)
+	}
+	if err := s.ensureParentFoldersLocked(targetPath); err != nil {
+		return err
+	}
+
+	if ctime <= 0 {
+		ctime = source.CTime
+	}
+	if mtime <= 0 {
+		mtime = source.MTime
+	}
+	cloned := &entry{
+		UID:    s.nextUID,
+		Path:   targetPath,
+		Folder: false,
+		Body:   append([]byte(nil), source.Body...),
+		CTime:  ctime,
+		MTime:  mtime,
+		Device: defaultDevice,
+	}
+	s.nextUID++
+	s.entriesBy[targetPath] = cloned
+	s.entriesByID[cloned.UID] = cloned
+	s.version++
+
+	return nil
 }
 
 func normalizePath(filePath string) string {

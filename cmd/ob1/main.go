@@ -62,6 +62,7 @@ func runWithArgs(args []string) int {
 	root.AddCommand(commands.NewGetCommand(runtime, &debug, &noCache))
 	root.AddCommand(commands.NewInfoCommand(runtime, &apiBase, &debug))
 	root.AddCommand(commands.NewListCommand(runtime, &debug, &noCache))
+	root.AddCommand(commands.NewMoveCommand(runtime, &debug, &noCache))
 	root.AddCommand(commands.NewPullCommand(runtime, &debug, &noCache))
 	root.AddCommand(commands.NewPutCommand(runtime, &debug, &noCache))
 	root.AddCommand(commands.NewRemoveCommand(runtime, &debug, &noCache))

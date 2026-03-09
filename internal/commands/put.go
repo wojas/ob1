@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -16,6 +17,16 @@ func NewPutCommand(rt Runtime, debug *bool, noCache *bool) *cobra.Command {
 	return &cobra.Command{
 		Use:   "put <file1> [file2] [...]",
 		Short: "Upload local files into the vault",
+		Long: strings.TrimSpace(`
+Upload one or more local files into the remote vault.
+
+Missing remote parent directories are created automatically. Directory inputs
+are rejected: pass file paths only.
+`),
+		Example: strings.TrimSpace(`
+  ob1 put note.md
+  ob1 put notes/todo.md assets/image.png
+`),
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := rt.requireWritable("put"); err != nil {
